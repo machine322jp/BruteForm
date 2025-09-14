@@ -1,0 +1,38 @@
+[package]
+name = "puyo_gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# エラー処理
+anyhow = "1"
+
+# シリアライゼーション
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 数値系
+num-bigint = "0.4"
+num-traits = "0.2"
+
+# 並列化・チャネル
+crossbeam-channel = "0.5"
+rayon = "1.10"
+
+# 高速ハッシュ（u64キー専用）
+nohash-hasher = "0.2"
+dashmap = "5"
+
+# GUI
+eframe = { version = "0.27", features = ["wgpu"] }
+egui = "0.27"
+rfd = "0.14"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"           # 必要なら "fat" に変更可
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
