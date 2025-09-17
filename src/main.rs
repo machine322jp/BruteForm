@@ -4187,6 +4187,16 @@ fn column_height_at(cols: &[[u16; W]; 4], x: usize) -> usize {
 }
 
 #[inline(always)]
+fn board_is_empty(cols: &[[u16; W]; 4]) -> bool {
+    for x in 0..W {
+        if (cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & MASK14 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(always)]
 fn is_cell_occupied(cols: &[[u16; W]; 4], x: usize, y: usize) -> bool {
     let bit = 1u16 << y;
     ((cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & bit) != 0
@@ -4201,6 +4211,22 @@ fn drop_same_color(cols: &mut [[u16; W]; 4], x: usize, color: u8, count: usize) 
         cols[color as usize][x] |= 1u16 << y;
         y += 1;
     }
+}
+
+#[inline(always)]
+fn set_cell_color(cols: &mut [[u16; W]; 4], x: usize, y: usize, color: u8) {
+    let bit = 1u16 << y;
+    for c in 0..4 {
+        cols[c][x] &= !bit;
+    }
+    cols[color as usize][x] |= bit;
+}
+
+#[inline(always)]
+fn next_filler_color(state: &mut u8) -> u8 {
+    let color = 1 + *state;
+    *state = (*state + 1) % 3;
+    color
 }
 
 struct Scenario {
@@ -4309,11 +4335,131 @@ struct GreedyResult {
     chain_length: u32,
 }
 
-fn build_greedy_chain(
-    initial: &[[u16; W]; 4],
+fn build_stacked_groups_on_columns(
+    board: &mut [[u16; W]; 4],
+    col_a: usize,
+    col_b: usize,
+    groups_target: usize,
+    filler_state: &mut u8,
+) -> usize {
+    let mut built = 0usize;
+    while built < groups_target {
+        let ha = column_height_at(board, col_a);
+        let hb = column_height_at(board, col_b);
+        if ha >= H || hb >= H {
+            break;
+        }
+        if ha < hb {
+            let filler = next_filler_color(filler_state);
+            drop_same_color(board, col_a, filler, 1);
+            continue;
+        } else if hb < ha {
+            let filler = next_filler_color(filler_state);
+            drop_same_color(board, col_b, filler, 1);
+            continue;
+        }
+        if H - ha < 2 || H - hb < 2 {
+            break;
+        }
+        drop_same_color(board, col_a, 0, 2);
+        drop_same_color(board, col_b, 0, 2);
+        built += 1;
+    }
+    built
+}
+
+fn build_chain_on_empty_board(
+    required_nonblank: &[u16; W],
     exact_four_only: bool,
     threshold: u32,
 ) -> Option<GreedyResult> {
+    let mut board = [[0u16; W]; 4];
+    let mut filler_state = 0u8;
+
+    for x in 0..W {
+        let mut mask = required_nonblank[x] & MASK14;
+        if mask == 0 {
+            continue;
+        }
+        let mut highest = 0usize;
+        while mask != 0 {
+            let bit = mask & (!mask + 1);
+            let y = bit.trailing_zeros() as usize;
+            if y + 1 > highest {
+                highest = y + 1;
+            }
+            mask &= mask - 1;
+        }
+        while column_height_at(&board, x) < highest {
+            let filler = next_filler_color(&mut filler_state);
+            drop_same_color(&mut board, x, filler, 1);
+        }
+    }
+
+    let mut best_pair: Option<(usize, usize)> = None;
+    let mut best_capacity: usize = 0;
+    for i in 0..W {
+        for j in (i + 1)..W {
+            let hi = column_height_at(&board, i);
+            let hj = column_height_at(&board, j);
+            let capacity = (H.saturating_sub(hi.max(hj))) / 2;
+            if capacity > 0 && capacity > best_capacity {
+                best_capacity = capacity;
+                best_pair = Some((i, j));
+            }
+        }
+    }
+
+    let mut built_groups: usize = 0;
+    if let Some((col_a, col_b)) = best_pair {
+        let mut target = threshold.max(1) as usize;
+        if target > best_capacity {
+            target = best_capacity;
+        }
+        if target > 0 {
+            built_groups = build_stacked_groups_on_columns(
+                &mut board,
+                col_a,
+                col_b,
+                target,
+                &mut filler_state,
+            );
+        }
+    }
+
+    if built_groups == 0 {
+        if let Some(col) = (0..W).find(|&x| H.saturating_sub(column_height_at(&board, x)) >= 4) {
+            drop_same_color(&mut board, col, 0, 4);
+        } else if let Some(col) = (0..W).find(|&x| column_height_at(&board, x) >= 4) {
+            for y in 0..4 {
+                set_cell_color(&mut board, col, y, 0);
+            }
+        } else {
+            drop_same_color(&mut board, W / 2, 0, 4);
+        }
+    }
+
+    let board_final = board;
+    let (chain_length, _) = simulate_chain_full(board_final, exact_four_only);
+    if chain_length == 0 {
+        return None;
+    }
+    Some(GreedyResult {
+        board: board_final,
+        chain_length,
+    })
+}
+
+fn build_greedy_chain(
+    initial: &[[u16; W]; 4],
+    required_nonblank: &[u16; W],
+    exact_four_only: bool,
+    threshold: u32,
+) -> Option<GreedyResult> {
+    if board_is_empty(initial) {
+        return build_chain_on_empty_board(required_nonblank, exact_four_only, threshold);
+    }
+
     let mut simulation = *initial;
     let mut events: Vec<(usize, u8, usize)> = Vec::new();
     let mut total_chain: u32 = 0;
@@ -5061,7 +5207,7 @@ fn run_small_chain_search_streaming(
             break;
         }
 
-        if let Some(result) = build_greedy_chain(&board_cols, exact_four_only, threshold) {
+        if let Some(result) = build_greedy_chain(&board_cols, &required_nonblank, exact_four_only, threshold) {
             let GreedyResult {
                 board: pre,
                 chain_length,
