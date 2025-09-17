@@ -1,4 +1,5 @@
 
+
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -18,6 +19,7 @@ use num_traits::{One, Zero, ToPrimitive};
 use rayon::prelude::*;
 use serde::Serialize;
 use dashmap::{DashMap, DashSet};
+use rand::Rng;
 
 // u64 キー専用のノーハッシュ（高速化）
 use nohash_hasher::BuildNoHashHasher;
@@ -37,6 +39,41 @@ enum Cell {
     Any,     // 'N' (空白 or 色)
     Any4,    // 'X' (色のみ)
     Abs(u8), // 0..12 = 'A'..'M'
+    Fixed(u8), // 0..=3 = '0'..'3' (RGBY固定)
+}
+
+#[inline(always)]
+fn apply_clear_no_fall(pre: &[[u16; W]; 4], clear: &[u16; W]) -> [[u16; W]; 4] {
+    let mut out = [[0u16; W]; 4];
+    let mut keep = [0u16; W];
+    for (x, k) in keep.iter_mut().enumerate() {
+        *k = (!clear[x]) & MASK14;
+    }
+    for (out_col, pre_col) in out.iter_mut().zip(pre.iter()) {
+        for (&k, (cell, &p)) in keep.iter().zip(out_col.iter_mut().zip(pre_col.iter())) {
+            *cell = p & k;
+        }
+    }
+    out
+}
+
+fn draw_pair_preview(ui: &mut egui::Ui, pair: (u8, u8)) {
+    let sz = Vec2::new(18.0, 18.0);
+    ui.vertical(|ui| {
+        // 表示規約: デフォルトは軸ぷよの上に子ぷよ（axis below, child above 表示）
+        let (txt1, fill1, stroke1) = cell_style(Cell::Fixed(pair.1)); // child (上)
+        let (txt0, fill0, stroke0) = cell_style(Cell::Fixed(pair.0)); // axis (下)
+        let top = egui::Button::new(RichText::new(txt1).size(11.0))
+            .min_size(sz)
+            .fill(fill1)
+            .stroke(stroke1);
+        let bot = egui::Button::new(RichText::new(txt0).size(11.0))
+            .min_size(sz)
+            .fill(fill0)
+            .stroke(stroke0);
+        let _ = ui.add(top);
+        let _ = ui.add(bot);
+    });
 }
 
 // ---- 計測（DFS 深さ×フェーズ） -------------------------
@@ -195,6 +232,11 @@ struct App {
     stats: Stats,
     preview: Option<[[u16; W]; 4]>,
     log_lines: Vec<String>,
+
+    // 画面モード
+    mode: Mode,
+    // 連鎖生成モードの状態
+    cp: ChainPlay,
 }
 
 #[derive(Default, Clone)]
@@ -262,9 +304,76 @@ impl Default for App {
             stats: Stats::default(),
             preview: None,
             log_lines: vec!["待機中".into()],
+            mode: Mode::BruteForce,
+            cp: ChainPlay::default(),
         }
     }
 }
+
+// 画面モード
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    BruteForce,
+    ChainPlay,
+}
+
+// 連鎖生成モード：保存状態
+#[derive(Clone, Copy)]
+struct SavedState {
+    cols: [[u16; W]; 4],
+    pair_index: usize,
+}
+
+// アニメーション段階
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimPhase {
+    AfterErase,
+    AfterFall,
+}
+
+#[derive(Clone, Copy)]
+struct AnimState {
+    phase: AnimPhase,
+    since: Instant,
+}
+
+// 連鎖生成モードのワーク
+struct ChainPlay {
+    cols: [[u16; W]; 4],
+    pair_seq: Vec<(u8, u8)>, // 軸, 子（0..=3）
+    pair_index: usize,
+    undo_stack: Vec<SavedState>,
+    anim: Option<AnimState>,
+    lock: bool, // 連鎖アニメ中ロック
+    // アニメ表示用：消去直後の盤面と、落下後の次盤面
+    erased_cols: Option<[[u16; W]; 4]>,
+    next_cols: Option<[[u16; W]; 4]>,
+}
+
+impl Default for ChainPlay {
+    fn default() -> Self {
+        let mut rng = rand::thread_rng();
+        let mut seq = Vec::with_capacity(128);
+        for _ in 0..128 {
+            seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
+        }
+        let cols = [[0u16; W]; 4];
+        let s0 = SavedState { cols, pair_index: 0 };
+        Self {
+            cols,
+            pair_seq: seq,
+            pair_index: 0,
+            undo_stack: vec![s0],
+            anim: None,
+            lock: false,
+            erased_cols: None,
+            next_cols: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Orient { Up, Right, Down, Left }
 
 fn install_japanese_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
@@ -334,6 +443,10 @@ fn main() -> Result<()> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 連鎖アニメーション進行
+        if self.mode == Mode::ChainPlay {
+            self.cp_step_animation();
+        }
         // 受信メッセージ処理（安全：take→処理→必要なら戻す）
         if let Some(rx) = self.rx.take() {
             let mut keep_rx = true;
@@ -375,83 +488,122 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("ぷよぷよ 連鎖形 総当たり（6×14）— Rust GUI（列ストリーミング＋LRU形キャッシュ＋並列化＋計測＋追撃最適化）");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.mode, Mode::BruteForce, "総当たり");
+                ui.selectable_value(&mut self.mode, Mode::ChainPlay, "連鎖生成");
+            });
         });
 
         // 左ペイン全体をひとつの ScrollArea でまとめる
         egui::SidePanel::left("left").min_width(420.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                if self.mode == Mode::BruteForce {
+                    // ── 入力と操作（総当たり） ─────────────────────────────
+                    ui.group(|ui| {
+                        ui.label("入力と操作");
+                        ui.label("左クリック: A→B→…→M / 中クリック: N→X→N / 右クリック: ・（空白） / Shift+左: RGBY");
 
-                // ── 入力と操作 ─────────────────────────────────────────────
-                ui.group(|ui| {
-                    ui.label("入力と操作");
-                    ui.label("左クリック: A→B→…→M / 中クリック: N→X→N / 右クリック: ・（空白）");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.threshold).clamp_range(1..=19).speed(0.1));
+                            ui.label("連鎖閾値");
+                            ui.add_space(8.0);
+                            ui.add(egui::DragValue::new(&mut self.lru_k).clamp_range(10..=1000).speed(1.0));
+                            ui.label("形キャッシュ上限(千)");
+                        });
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.threshold).clamp_range(1..=19).speed(0.1));
-                        ui.label("連鎖閾値");
-                        ui.add_space(8.0);
-                        ui.add(egui::DragValue::new(&mut self.lru_k).clamp_range(10..=1000).speed(1.0));
-                        ui.label("形キャッシュ上限(千)");
-                    });
+                        // ★ 進捗停滞 早期終了
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.stop_progress_plateau)
+                                    .clamp_range(0.0..=1.0)
+                                    .speed(0.01),
+                            );
+                            ui.label("早期終了: 進捗停滞比 (0=無効, 例 0.10)");
+                        });
 
-                    // ★ 進捗停滞 早期終了
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.stop_progress_plateau)
-                                .clamp_range(0.0..=1.0)
-                                .speed(0.01),
-                        );
-                        ui.label("早期終了: 進捗停滞比 (0=無効, 例 0.10)");
-                    });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.exact_four_only, "4個消しモード（5個以上で消えたら除外）");
+                        });
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.exact_four_only, "4個消しモード（5個以上で消えたら除外）");
-                    });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.profile_enabled, "計測を有効化（軽量）");
+                        });
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.profile_enabled, "計測を有効化（軽量）");
-                    });
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.running, egui::Button::new("Run"))
-                            .clicked()
-                        {
-                            self.start_run();
-                        }
-                        if ui
-                            .add_enabled(self.running, egui::Button::new("Stop"))
-                            .clicked()
-                        {
-                            self.abort_flag.store(true, Ordering::Relaxed);
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("出力ファイル:");
-                        ui.text_edit_singleline(&mut self.out_name);
-                        if ui.button("Browse…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_title("保存先の選択")
-                                .set_file_name(&self.out_name)
-                                .save_file()
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.running, egui::Button::new("Run"))
+                                .clicked()
                             {
-                                self.out_path = Some(path.clone());
-                                self.out_name = path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into();
+                                self.start_run();
                             }
-                        }
+                            if ui
+                                .add_enabled(self.running, egui::Button::new("Stop"))
+                                .clicked()
+                            {
+                                self.abort_flag.store(true, Ordering::Relaxed);
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("出力ファイル:");
+                            ui.text_edit_singleline(&mut self.out_name);
+                            if ui.button("Browse…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("保存先の選択")
+                                    .set_file_name(&self.out_name)
+                                    .save_file()
+                                {
+                                    self.out_path = Some(path.clone());
+                                    self.out_name = path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into();
+                                }
+                            }
+                        });
                     });
-                });
+                } else {
+                    // ── 連鎖生成モードの操作 ─────────────────────────────
+                    ui.group(|ui| {
+                        ui.label("連鎖生成 — 操作");
+                        let cur = self.cp_current_pair();
+                        let nxt = self.cp_next_pair();
+                        let dnx = self.cp_dnext_pair();
+
+                        ui.horizontal(|ui| {
+                            ui.label("現在手:");
+                            draw_pair_preview(ui, cur);
+                            ui.add_space(12.0);
+                            ui.label("Next:");
+                            draw_pair_preview(ui, nxt);
+                            ui.add_space(12.0);
+                            ui.label("Next2:");
+                            draw_pair_preview(ui, dnx);
+                        });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let can_ops = !self.cp.lock && self.cp.anim.is_none();
+                            if ui.add_enabled(can_ops, egui::Button::new("ランダム配置")).clicked() {
+                                self.cp_place_random();
+                            }
+                            if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("戻る")).clicked() {
+                                self.cp_undo();
+                            }
+                            if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("初手に戻る")).clicked() {
+                                self.cp_reset_to_initial();
+                            }
+                        });
+                        ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                    });
+                }
 
                 ui.separator();
 
                 // ── 処理時間（累積） ────────────────────────────────────────
-                if !self.running && self.profile_enabled && has_profile_any(&self.stats.profile) {
+                if self.mode == Mode::BruteForce && !self.running && self.profile_enabled && has_profile_any(&self.stats.profile) {
                     ui.group(|ui| {
                         ui.label("処理時間（累積）");
                         show_profile_table(ui, &self.stats.profile);
@@ -460,97 +612,298 @@ impl eframe::App for App {
                 }
 
                 // ── プレビュー ─────────────────────────────────────────────
-                ui.label("プレビュー（E1直前の落下後盤面）");
-                ui.add_space(4.0);
-                if let Some(cols) = &self.preview {
-                    draw_preview(ui, cols);
-                } else {
-                    ui.label(
-                        egui::RichText::new("（実行中に更新表示）")
-                            .italics()
-                            .color(Color32::GRAY),
-                    );
-                }
-
-                ui.separator();
-
-                // ── ログ ──────────────────────────────────────────────────
-                ui.label("ログ");
-                for line in &self.log_lines {
-                    ui.monospace(line);
-                }
-
-                ui.separator();
-
-                // ── 実行・進捗 ────────────────────────────────────────────
-                ui.group(|ui| {
-                    ui.label("実行・進捗");
-                    let pct = {
-                        let total = self.stats.total.to_f64().unwrap_or(0.0);
-                        let done = self.stats.done.to_f64().unwrap_or(0.0);
-                        if total > 0.0 { (done / total * 100.0).clamp(0.0, 100.0) } else { 0.0 }
-                    };
-                    ui.label(format!("進捗: {:.1}%", pct));
-                    ui.add(egui::ProgressBar::new((pct / 100.0) as f32).show_percentage());
-
+                if self.mode == Mode::BruteForce {
+                    ui.label("プレビュー（E1直前の落下後盤面）");
                     ui.add_space(4.0);
-                    ui.monospace(format!(
-                        "探索中: {} / 代表集合: {} / 出力件数: {} / 展開節点: {} / 枝刈り: {} / 総組合せ(厳密): {} / 完了: {} / 速度: {:.1} nodes/s / メモ: L-hit={} G-hit={} Miss={} / 形キャッシュ: 上限={} 実={}",
-                        if self.stats.searching { "YES" } else { "NO" },
-                        self.stats.unique,
-                        self.stats.output,
-                        self.stats.nodes,
-                        self.stats.pruned,
-                        &self.stats.total,
-                        &self.stats.done,
-                        self.stats.rate,
-                        self.stats.memo_hit_local,
-                        self.stats.memo_hit_global,
-                        self.stats.memo_miss,
-                        self.stats.lru_limit,
-                        self.stats.memo_len
-                    ));
-                });
+                    if let Some(cols) = &self.preview {
+                        draw_preview(ui, cols);
+                    } else {
+                        ui.label(
+                            egui::RichText::new("（実行中に更新表示）")
+                                .italics()
+                                .color(Color32::GRAY),
+                        );
+                    }
+                }
+
+                ui.separator();
+
+                if self.mode == Mode::BruteForce {
+                    // ── ログ ──────────────────────────────────────────────
+                    ui.label("ログ");
+                    for line in &self.log_lines {
+                        ui.monospace(line);
+                    }
+                }
+
+                ui.separator();
+
+                if self.mode == Mode::BruteForce {
+                    // ── 実行・進捗 ────────────────────────────────────────
+                    ui.group(|ui| {
+                        ui.label("実行・進捗");
+                        let pct = {
+                            let total = self.stats.total.to_f64().unwrap_or(0.0);
+                            let done = self.stats.done.to_f64().unwrap_or(0.0);
+                            if total > 0.0 { (done / total * 100.0).clamp(0.0, 100.0) } else { 0.0 }
+                        };
+                        ui.label(format!("進捗: {:.1}%", pct));
+                        ui.add(egui::ProgressBar::new((pct / 100.0) as f32).show_percentage());
+
+                        ui.add_space(4.0);
+                        ui.monospace(format!(
+                            "探索中: {} / 代表集合: {} / 出力件数: {} / 展開節点: {} / 枝刈り: {} / 総組合せ(厳密): {} / 完了: {} / 速度: {:.1} nodes/s / メモ: L-hit={} G-hit={} Miss={} / 形キャッシュ: 上限={} 実={}",
+                            if self.stats.searching { "YES" } else { "NO" },
+                            self.stats.unique,
+                            self.stats.output,
+                            self.stats.nodes,
+                            self.stats.pruned,
+                            &self.stats.total,
+                            &self.stats.done,
+                            self.stats.rate,
+                            self.stats.memo_hit_local,
+                            self.stats.memo_hit_global,
+                            self.stats.memo_miss,
+                            self.stats.lru_limit,
+                            self.stats.memo_len
+                        ));
+                    });
+                }
             });
         });
 
         // 盤面側もスクロール可能に
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・）");
-                ui.add_space(6.0);
+                if self.mode == Mode::BruteForce {
+                    ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
+                    ui.add_space(6.0);
 
-                let cell_size = Vec2::new(28.0, 28.0);
-                let gap = 2.0;
+                    let cell_size = Vec2::new(28.0, 28.0);
+                    let gap = 2.0;
 
-                for y in (0..H).rev() {
-                    ui.horizontal(|ui| {
-                        for x in 0..W {
-                            let i = y * W + x;
-                            let (text, fill, stroke) = cell_style(self.board[i]);
-                            let btn = egui::Button::new(RichText::new(text).size(12.0))
-                                .min_size(cell_size)
-                                .fill(fill)
-                                .stroke(stroke);
-                            let resp = ui.add(btn);
-                            if resp.clicked_by(egui::PointerButton::Primary) {
-                                self.board[i] = cycle_abs(self.board[i]);
+                    let shift_pressed = ui.input(|i| i.modifiers.shift);
+                    for y in (0..H).rev() {
+                        ui.horizontal(|ui| {
+                            for x in 0..W {
+                                let i = y * W + x;
+                                let (text, fill, stroke) = cell_style(self.board[i]);
+                                let btn = egui::Button::new(RichText::new(text).size(12.0))
+                                    .min_size(cell_size)
+                                    .fill(fill)
+                                    .stroke(stroke);
+                                let resp = ui.add(btn);
+                                if resp.clicked_by(egui::PointerButton::Primary) {
+                                    if shift_pressed {
+                                        self.board[i] = cycle_fixed(self.board[i]);
+                                    } else {
+                                        self.board[i] = cycle_abs(self.board[i]);
+                                    }
+                                }
+                                if resp.clicked_by(egui::PointerButton::Middle) {
+                                    self.board[i] = cycle_any(self.board[i]);
+                                }
+                                if resp.clicked_by(egui::PointerButton::Secondary) {
+                                    self.board[i] = Cell::Blank;
+                                }
+                                ui.add_space(gap);
                             }
-                            if resp.clicked_by(egui::PointerButton::Middle) {
-                                self.board[i] = cycle_any(self.board[i]);
-                            }
-                            if resp.clicked_by(egui::PointerButton::Secondary) {
-                                self.board[i] = Cell::Blank;
-                            }
-                            ui.add_space(gap);
-                        }
-                    });
-                    ui.add_space(gap);
+                        });
+                        ui.add_space(gap);
+                    }
+                } else {
+                    ui.label("連鎖生成 — 盤面");
+                    ui.add_space(6.0);
+                    draw_preview(ui, &self.cp.cols);
                 }
             });
         });
 
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+}
+
+// 連鎖生成モード：実装（App メソッド）
+impl App {
+    // ===== 連鎖生成モード：ユーティリティ =====
+    fn cp_current_pair(&self) -> (u8, u8) {
+        let idx = self.cp.pair_index % self.cp.pair_seq.len().max(1);
+        self.cp.pair_seq[idx]
+    }
+    fn cp_next_pair(&self) -> (u8, u8) {
+        let idx = (self.cp.pair_index + 1) % self.cp.pair_seq.len().max(1);
+        self.cp.pair_seq[idx]
+    }
+    fn cp_dnext_pair(&self) -> (u8, u8) {
+        let idx = (self.cp.pair_index + 2) % self.cp.pair_seq.len().max(1);
+        self.cp.pair_seq[idx]
+    }
+
+    fn cp_undo(&mut self) {
+        if self.cp.undo_stack.len() > 1 && !self.cp.lock {
+            self.cp.anim = None;
+            self.cp.erased_cols = None;
+            self.cp.next_cols = None;
+            if let Some(prev) = self.cp.undo_stack.pop() {
+                let _ = prev; // pop current snapshot
+            }
+            if let Some(last) = self.cp.undo_stack.last().copied() {
+                self.cp.cols = last.cols;
+                self.cp.pair_index = last.pair_index;
+            }
+        }
+    }
+
+    fn cp_reset_to_initial(&mut self) {
+        if self.cp.lock { return; }
+        self.cp.anim = None;
+        self.cp.erased_cols = None;
+        self.cp.next_cols = None;
+        if let Some(first) = self.cp.undo_stack.first().copied() {
+            self.cp.cols = first.cols;
+            self.cp.pair_index = first.pair_index;
+            // 初期スナップショットだけ残す
+            self.cp.undo_stack.clear();
+            self.cp.undo_stack.push(first);
+        }
+        self.cp.lock = false;
+    }
+
+    fn cp_place_random(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() { return; }
+        // 事前スナップショット
+        self.cp.undo_stack.push(SavedState { cols: self.cp.cols, pair_index: self.cp.pair_index });
+
+        let pair = self.cp_current_pair();
+        let mut rng = rand::thread_rng();
+
+        // 有効手集合を列挙
+        let mut moves: Vec<(usize, Orient)> = Vec::new();
+        for x in 0..W {
+            // 垂直（Up/Down）: 同一列に2個置けるか
+            let h = self.cp_col_height(x);
+            if h + 1 < H { moves.push((x, Orient::Up)); moves.push((x, Orient::Down)); }
+            // 右
+            if x + 1 < W {
+                let h0 = self.cp_col_height(x);
+                let h1 = self.cp_col_height(x + 1);
+                if h0 < H && h1 < H { moves.push((x, Orient::Right)); }
+            }
+            // 左
+            if x >= 1 {
+                let h0 = self.cp_col_height(x);
+                let h1 = self.cp_col_height(x - 1);
+                if h0 < H && h1 < H { moves.push((x, Orient::Left)); }
+            }
+        }
+        if moves.is_empty() {
+            // 置けない（詰み）: スナップショットは維持するがインデックスは進めない
+            self.push_log("置ける場所がありません".into());
+            let _ = self.cp.undo_stack.pop();
+            return;
+        }
+        let (x, orient) = moves[rng.gen_range(0..moves.len())];
+
+        self.cp_place_with(x, orient, pair);
+        // 連鎖開始チェック
+        self.cp_check_and_start_chain();
+    }
+
+    fn cp_place_with(&mut self, x: usize, orient: Orient, pair: (u8, u8)) {
+        // 盤面に2つの色を追加（重力後の最下段に直接置く）
+        match orient {
+            Orient::Up => {
+                let h = self.cp_col_height(x);
+                self.cp_set_cell(x, h, pair.0);
+                self.cp_set_cell(x, h + 1, pair.1);
+            }
+            Orient::Down => {
+                let h = self.cp_col_height(x);
+                self.cp_set_cell(x, h, pair.1);
+                self.cp_set_cell(x, h + 1, pair.0);
+            }
+            Orient::Right => {
+                let h0 = self.cp_col_height(x);
+                let h1 = self.cp_col_height(x + 1);
+                self.cp_set_cell(x, h0, pair.0);
+                self.cp_set_cell(x + 1, h1, pair.1);
+            }
+            Orient::Left => {
+                let h0 = self.cp_col_height(x);
+                let h1 = self.cp_col_height(x - 1);
+                self.cp_set_cell(x, h0, pair.0);
+                self.cp_set_cell(x - 1, h1, pair.1);
+            }
+        }
+        // 次の手へ
+        if !self.cp.pair_seq.is_empty() {
+            self.cp.pair_index = (self.cp.pair_index + 1) % self.cp.pair_seq.len();
+        }
+    }
+
+    fn cp_col_height(&self, x: usize) -> usize {
+        let occ = (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x]) & MASK14;
+        occ.count_ones() as usize
+    }
+
+    fn cp_set_cell(&mut self, x: usize, y: usize, color: u8) {
+        if x >= W || y >= H { return; }
+        let bit = 1u16 << y;
+        let c = (color as usize).min(3);
+        self.cp.cols[c][x] |= bit;
+    }
+
+    fn cp_check_and_start_chain(&mut self) {
+        // 4連結抽出
+        let clear = compute_erase_mask_cols(&self.cp.cols);
+        let any = (0..W).any(|x| clear[x] != 0);
+        if !any {
+            // 連鎖なし
+            return;
+        }
+        // 連鎖開始：操作ロック
+        self.cp.lock = true;
+        // 消去直後表示と次盤面作成
+        let erased = apply_clear_no_fall(&self.cp.cols, &clear);
+        let next = apply_given_clear_and_fall(&self.cp.cols, &clear);
+        self.cp.erased_cols = Some(erased);
+        self.cp.next_cols = Some(next);
+        self.cp.cols = erased; // 消えた状態を表示
+        self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+    }
+
+    fn cp_step_animation(&mut self) {
+        let Some(anim) = self.cp.anim else { return; };
+        let elapsed = anim.since.elapsed();
+        if elapsed < Duration::from_millis(500) { return; }
+        match anim.phase {
+            AnimPhase::AfterErase => {
+                if let Some(next) = self.cp.next_cols.take() {
+                    self.cp.cols = next;
+                }
+                self.cp.anim = Some(AnimState { phase: AnimPhase::AfterFall, since: Instant::now() });
+                // 次の消去準備は AfterFall 経由
+            }
+            AnimPhase::AfterFall => {
+                // 次の連鎖チェック
+                let clear = compute_erase_mask_cols(&self.cp.cols);
+                let any = (0..W).any(|x| clear[x] != 0);
+                if !any {
+                    // 完了
+                    self.cp.anim = None;
+                    self.cp.erased_cols = None;
+                    self.cp.next_cols = None;
+                    self.cp.lock = false;
+                } else {
+                    let erased = apply_clear_no_fall(&self.cp.cols, &clear);
+                    let next = apply_given_clear_and_fall(&self.cp.cols, &clear);
+                    self.cp.cols = erased;
+                    self.cp.erased_cols = Some(erased);
+                    self.cp.next_cols = Some(next);
+                    self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+                }
+            }
+        }
     }
 }
 
@@ -715,6 +1068,7 @@ impl Cell {
             Cell::Any => 'N',
             Cell::Any4 => 'X',
             Cell::Abs(i) => (b'A' + i) as char,
+            Cell::Fixed(c) => (b'0' + c) as char,
         }
     }
 }
@@ -744,12 +1098,43 @@ fn cell_style(c: Cell) -> (String, Color32, egui::Stroke) {
                 egui::Stroke::new(1.0, Color32::from_rgb(99, 102, 241)),
             )
         }
+        Cell::Fixed(i) => {
+            // 0:R, 1:G, 2:B, 3:Y（表示は R/G/B/Y）
+            match i {
+                0 => (
+                    "R".to_string(),
+                    Color32::from_rgb(254, 226, 226),
+                    egui::Stroke::new(1.0, Color32::from_rgb(239, 68, 68)),
+                ),
+                1 => (
+                    "G".to_string(),
+                    Color32::from_rgb(220, 252, 231),
+                    egui::Stroke::new(1.0, Color32::from_rgb(34, 197, 94)),
+                ),
+                2 => (
+                    "B".to_string(),
+                    Color32::from_rgb(219, 234, 254),
+                    egui::Stroke::new(1.0, Color32::from_rgb(59, 130, 246)),
+                ),
+                3 => (
+                    "Y".to_string(),
+                    Color32::from_rgb(254, 249, 195),
+                    egui::Stroke::new(1.0, Color32::from_rgb(234, 179, 8)),
+                ),
+                _ => (
+                    "?".to_string(),
+                    Color32::LIGHT_GRAY,
+                    egui::Stroke::new(1.0, Color32::DARK_GRAY),
+                ),
+            }
+        }
     }
 }
 fn cycle_abs(c: Cell) -> Cell {
     match c {
         Cell::Blank | Cell::Any | Cell::Any4 => Cell::Abs(0),
         Cell::Abs(i) => Cell::Abs(((i as usize + 1) % 13) as u8),
+        Cell::Fixed(_) => Cell::Abs(0),
     }
 }
 fn cycle_any(c: Cell) -> Cell {
@@ -757,6 +1142,12 @@ fn cycle_any(c: Cell) -> Cell {
         Cell::Any => Cell::Any4,
         Cell::Any4 => Cell::Any,
         _ => Cell::Any,
+    }
+}
+fn cycle_fixed(c: Cell) -> Cell {
+    match c {
+        Cell::Fixed(v) => Cell::Fixed(((v as usize + 1) % 4) as u8),
+        _ => Cell::Fixed(0),
     }
 }
 
@@ -771,11 +1162,12 @@ fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
         ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
+    // 0=R, 1=G, 2=B, 3=Y
     let palette = [
-        Color32::from_rgb(96, 165, 250),  // blue
-        Color32::from_rgb(244, 114, 182), // pink
-        Color32::from_rgb(251, 191, 36),  // yellow
-        Color32::from_rgb(52, 211, 153),  // green
+        Color32::from_rgb(239, 68, 68),   // red
+        Color32::from_rgb(34, 197, 94),   // green
+        Color32::from_rgb(59, 130, 246),  // blue
+        Color32::from_rgb(234, 179, 8),   // yellow
     ];
 
     for y in 0..H {
