@@ -2001,23 +2001,19 @@ fn build_component_candidate(
     target_idx: usize,
     piece_components: &[Option<usize>],
 ) -> Option<Candidate> {
-    let mut max_idx: Option<usize> = None;
+    debug_assert_eq!(piece_components.len(), total_count);
+    let mut target_indices: Vec<usize> = Vec::new();
+    let mut extra_indices: Vec<usize> = Vec::new();
     for (idx, comp_opt) in piece_components.iter().enumerate() {
-        if *comp_opt == Some(target_idx) {
-            max_idx = Some(idx);
+        match comp_opt {
+            Some(comp) if *comp == target_idx => target_indices.push(idx),
+            _ => extra_indices.push(idx),
         }
     }
-    let Some(max_idx) = max_idx else {
+    if target_indices.is_empty() {
         return None;
-    };
-    let keep_count = max_idx + 1;
-    for i in 0..keep_count {
-        if let Some(idx) = piece_components[i] {
-            if idx != target_idx {
-                return None;
-            }
-        }
     }
+    let keep_count = target_indices.len();
     let mut placements = vec![PlacementInfo {
         column,
         color,
@@ -2032,12 +2028,7 @@ fn build_component_candidate(
     }
 
     let mut extra: Vec<PlacementInfo> = Vec::new();
-    for i in keep_count..total_count {
-        if let Some(idx) = piece_components[i] {
-            if idx == target_idx {
-                continue;
-            }
-        }
+    for _ in extra_indices {
         let mut placed = false;
         for dir in [-1isize, 1isize] {
             let nx = column as isize + dir;
