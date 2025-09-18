@@ -1852,9 +1852,7 @@ fn component_from_seed_cols(s: &[u16; W], seed_x: usize, seed_bits: u16) -> [u16
 
 #[derive(Clone)]
 struct Candidate {
-    column: usize,
-    color: u8,
-    count: usize,
+    placements: Vec<PlacementInfo>,
     chain_count: usize,
     after_board: [[u16; W]; 4],
 }
@@ -1863,6 +1861,10 @@ struct Candidate {
 struct PlanResult {
     total_chain: usize,
     placements: Vec<PlacementInfo>,
+}
+
+fn placement_piece_total(seq: &[PlacementInfo]) -> usize {
+    seq.iter().map(|p| p.count).sum()
 }
 
 fn col_height_cols(cols: &[[u16; W]; 4], x: usize) -> usize {
@@ -1972,10 +1974,126 @@ fn simulate_chain_with_initial_clear(
     (chain_count, board_next)
 }
 
+fn merge_placements(seq: Vec<PlacementInfo>) -> Vec<PlacementInfo> {
+    let mut merged: Vec<PlacementInfo> = Vec::new();
+    for p in seq {
+        if p.count == 0 {
+            continue;
+        }
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|e| e.column == p.column && e.color == p.color)
+        {
+            existing.count += p.count;
+        } else {
+            merged.push(p);
+        }
+    }
+    merged
+}
+
+fn build_component_candidate(
+    base_board: &[[u16; W]; 4],
+    column: usize,
+    color: u8,
+    start_height: usize,
+    total_count: usize,
+    target_idx: usize,
+    piece_components: &[Option<usize>],
+) -> Option<Candidate> {
+    let mut max_idx: Option<usize> = None;
+    for (idx, comp_opt) in piece_components.iter().enumerate() {
+        if *comp_opt == Some(target_idx) {
+            max_idx = Some(idx);
+        }
+    }
+    let Some(max_idx) = max_idx else {
+        return None;
+    };
+    let keep_count = max_idx + 1;
+    for i in 0..keep_count {
+        if let Some(idx) = piece_components[i] {
+            if idx != target_idx {
+                return None;
+            }
+        }
+    }
+    let mut placements = vec![PlacementInfo {
+        column,
+        color,
+        count: keep_count,
+    }];
+    let mut board_progress = apply_sequence(base_board, &placements)?;
+    let mut clear = compute_erase_mask_cols(&board_progress);
+    let mut comps = components_from_mask(&clear);
+    let main_top_bit = 1u16 << (start_height + keep_count - 1);
+    if comps.len() != 1 || clear[column] & main_top_bit == 0 {
+        return None;
+    }
+
+    let mut extra: Vec<PlacementInfo> = Vec::new();
+    for i in keep_count..total_count {
+        if let Some(idx) = piece_components[i] {
+            if idx == target_idx {
+                continue;
+            }
+        }
+        let mut placed = false;
+        for dir in [-1isize, 1isize] {
+            let nx = column as isize + dir;
+            if nx < 0 || nx >= W as isize {
+                continue;
+            }
+            let nx = nx as usize;
+            let adj_colors = adjacent_colors(&board_progress, nx);
+            if !adj_colors.contains(&color) {
+                continue;
+            }
+            let mut board_candidate = board_progress;
+            let h = col_height_cols(&board_candidate, nx);
+            if h >= H {
+                continue;
+            }
+            board_candidate[color as usize][nx] |= 1u16 << h;
+            let clear_candidate = compute_erase_mask_cols(&board_candidate);
+            let comps_candidate = components_from_mask(&clear_candidate);
+            if comps_candidate.len() == 1 && clear_candidate[column] & main_top_bit != 0 {
+                board_progress = board_candidate;
+                clear = clear_candidate;
+                comps = comps_candidate;
+                extra.push(PlacementInfo {
+                    column: nx,
+                    color,
+                    count: 1,
+                });
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            // cancel piece
+        }
+    }
+
+    if comps.len() != 1 || clear[column] & main_top_bit == 0 {
+        return None;
+    }
+    let (chain_count, after_board) = simulate_chain_with_initial_clear(&board_progress, &clear);
+    placements.extend(extra);
+    let placements = merge_placements(placements);
+    Some(Candidate {
+        placements,
+        chain_count,
+        after_board,
+    })
+}
+
 fn finalize_candidate(
+    base_board: &[[u16; W]; 4],
     board_with_add: [[u16; W]; 4],
     column: usize,
     color: u8,
+    start_height: usize,
     count: usize,
 ) -> Option<Candidate> {
     let clear = compute_erase_mask_cols(&board_with_add);
@@ -1983,17 +2101,59 @@ fn finalize_candidate(
         return None;
     }
     let components = components_from_mask(&clear);
-    if components.len() != 1 {
-        return None;
+    if components.len() == 1 {
+        let (chain_count, after_board) = simulate_chain_with_initial_clear(&board_with_add, &clear);
+        return Some(Candidate {
+            placements: vec![PlacementInfo {
+                column,
+                color,
+                count,
+            }],
+            chain_count,
+            after_board,
+        });
     }
-    let (chain_count, after_board) = simulate_chain_with_initial_clear(&board_with_add, &clear);
-    Some(Candidate {
-        column,
-        color,
-        count,
-        chain_count,
-        after_board,
-    })
+
+    let mut piece_components: Vec<Option<usize>> = vec![None; count];
+    for (idx, comp) in components.iter().enumerate() {
+        let mut mask = comp[column];
+        while mask != 0 {
+            let bit = mask & (!mask + 1);
+            let height = bit.trailing_zeros() as usize;
+            if height >= start_height && height < start_height + count {
+                piece_components[height - start_height] = Some(idx);
+            }
+            mask &= !bit;
+        }
+    }
+
+    let mut best: Option<Candidate> = None;
+    for target_idx in 0..components.len() {
+        let candidate = build_component_candidate(
+            base_board,
+            column,
+            color,
+            start_height,
+            count,
+            target_idx,
+            &piece_components,
+        );
+        if let Some(cand) = candidate {
+            match &best {
+                None => best = Some(cand),
+                Some(cur) => {
+                    if cand.chain_count > cur.chain_count
+                        || (cand.chain_count == cur.chain_count
+                            && placement_piece_total(&cand.placements)
+                                < placement_piece_total(&cur.placements))
+                    {
+                        best = Some(cand);
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 fn try_adjust_to_adjacent(
@@ -2013,7 +2173,7 @@ fn try_adjust_to_adjacent(
             continue;
         }
         let mut board_add = *base_board;
-        let mut last_y: Option<usize> = None;
+        let start_h = col_height_cols(base_board, nx);
         let mut ok = true;
         for _ in 0..count {
             let h = col_height_cols(&board_add, nx);
@@ -2022,20 +2182,11 @@ fn try_adjust_to_adjacent(
                 break;
             }
             board_add[color as usize][nx] |= 1u16 << h;
-            last_y = Some(h);
         }
         if !ok {
             continue;
         }
-        let Some(last_y) = last_y else {
-            continue;
-        };
-        let comp = component_from_seed_cols(&board_add[color as usize], nx, 1u16 << last_y);
-        let comp_size: usize = comp.iter().map(|m| m.count_ones() as usize).sum();
-        if comp_size < 4 {
-            continue;
-        }
-        if let Some(cand) = finalize_candidate(board_add, nx, color, count) {
+        if let Some(cand) = finalize_candidate(base_board, board_add, nx, color, start_h, count) {
             return Some(cand);
         }
     }
@@ -2048,7 +2199,8 @@ fn evaluate_column_candidate(
     color: u8,
 ) -> Option<Candidate> {
     let mut board_add = *base_board;
-    for added in 1..=(H - col_height_cols(base_board, column)) {
+    let start_height = col_height_cols(base_board, column);
+    for added in 1..=(H - start_height) {
         let h = col_height_cols(&board_add, column);
         if h >= H {
             break;
@@ -2059,7 +2211,9 @@ fn evaluate_column_candidate(
         if comp_size < 4 {
             continue;
         }
-        if let Some(cand) = finalize_candidate(board_add, column, color, added) {
+        if let Some(cand) =
+            finalize_candidate(base_board, board_add, column, color, start_height, added)
+        {
             return Some(cand);
         }
         if let Some(adj) = try_adjust_to_adjacent(base_board, column, color, added) {
@@ -2079,7 +2233,11 @@ fn generate_candidates(cols: &[[u16; W]; 4]) -> Vec<Candidate> {
             }
         }
     }
-    cands.sort_by(|a, b| b.chain_count.cmp(&a.chain_count));
+    cands.sort_by(|a, b| {
+        b.chain_count.cmp(&a.chain_count).then_with(|| {
+            placement_piece_total(&a.placements).cmp(&placement_piece_total(&b.placements))
+        })
+    });
     cands
 }
 
@@ -2100,11 +2258,7 @@ fn compute_virtual_plan(cols: &[[u16; W]; 4]) -> Option<PlanResult> {
             if after_occ >= occ {
                 continue;
             }
-            let mut placements = vec![PlacementInfo {
-                column: cand.column,
-                color: cand.color,
-                count: cand.count,
-            }];
+            let mut placements = cand.placements.clone();
             let mut total_chain = cand.chain_count;
             if after_occ == 0 {
                 // 完全消去
@@ -2123,7 +2277,8 @@ fn compute_virtual_plan(cols: &[[u16; W]; 4]) -> Option<PlanResult> {
                 Some(cur) => {
                     if result.total_chain > cur.total_chain
                         || (result.total_chain == cur.total_chain
-                            && result.placements.len() < cur.placements.len())
+                            && placement_piece_total(&result.placements)
+                                < placement_piece_total(&cur.placements))
                     {
                         best = Some(result);
                     }
