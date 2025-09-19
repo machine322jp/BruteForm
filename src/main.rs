@@ -435,6 +435,36 @@ fn col_height_from_cols(cols: &[[u16; W]; 4], x: usize) -> usize {
 }
 
 #[inline(always)]
+fn calc_col_heights(cols: &[[u16; W]; 4]) -> [usize; W] {
+    let mut heights = [0usize; W];
+    for x in 0..W {
+        heights[x] = col_height_from_cols(cols, x);
+    }
+    heights
+}
+
+#[inline(always)]
+fn count_valid_moves(heights: &[usize; W]) -> usize {
+    let mut total = 0usize;
+    for x in 0..W {
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            total += 2; // Up + Down
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            total += 1; // Right
+        }
+        if x >= 1 && heights[x - 1] < H {
+            total += 1; // Left
+        }
+    }
+    total
+}
+
+#[inline(always)]
 fn set_cell_in_cols(cols: &mut [[u16; W]; 4], x: usize, y: usize, color: u8) {
     debug_assert!(x < W && y < H);
     let bit = 1u16 << y;
@@ -442,73 +472,16 @@ fn set_cell_in_cols(cols: &mut [[u16; W]; 4], x: usize, y: usize, color: u8) {
     cols[idx][x] |= bit;
 }
 
-fn for_each_valid_move<T, F>(cols: &[[u16; W]; 4], mut f: F) -> Option<T>
-where
-    F: FnMut(CpMove) -> Option<T>,
-{
-    for x in 0..W {
-        let h = col_height_from_cols(cols, x);
-        if h >= H {
-            continue;
-        }
-        if h + 1 < H {
-            if let Some(out) = f(CpMove {
-                x,
-                orient: Orient::Up,
-            }) {
-                return Some(out);
-            }
-            if let Some(out) = f(CpMove {
-                x,
-                orient: Orient::Down,
-            }) {
-                return Some(out);
-            }
-        }
-        if x + 1 < W {
-            let h1 = col_height_from_cols(cols, x + 1);
-            if h1 < H {
-                if let Some(out) = f(CpMove {
-                    x,
-                    orient: Orient::Right,
-                }) {
-                    return Some(out);
-                }
-            }
-        }
-        if x >= 1 {
-            let h1 = col_height_from_cols(cols, x - 1);
-            if h1 < H {
-                if let Some(out) = f(CpMove {
-                    x,
-                    orient: Orient::Left,
-                }) {
-                    return Some(out);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn list_valid_moves(cols: &[[u16; W]; 4]) -> Vec<CpMove> {
-    let mut moves = Vec::new();
-    let _ = for_each_valid_move(cols, |mv| {
-        moves.push(mv);
-        Option::<()>::None
-    });
-    moves
-}
-
 fn simulate_move_on_cols(
     cols: &[[u16; W]; 4],
+    heights: &[usize; W],
     pair: (u8, u8),
     mv: CpMove,
 ) -> Option<(u32, [[u16; W]; 4])> {
     let mut next = *cols;
     match mv.orient {
         Orient::Up => {
-            let h = col_height_from_cols(cols, mv.x);
+            let h = heights[mv.x];
             if h + 1 >= H {
                 return None;
             }
@@ -516,7 +489,7 @@ fn simulate_move_on_cols(
             set_cell_in_cols(&mut next, mv.x, h + 1, pair.1);
         }
         Orient::Down => {
-            let h = col_height_from_cols(cols, mv.x);
+            let h = heights[mv.x];
             if h + 1 >= H {
                 return None;
             }
@@ -527,8 +500,8 @@ fn simulate_move_on_cols(
             if mv.x + 1 >= W {
                 return None;
             }
-            let h0 = col_height_from_cols(cols, mv.x);
-            let h1 = col_height_from_cols(cols, mv.x + 1);
+            let h0 = heights[mv.x];
+            let h1 = heights[mv.x + 1];
             if h0 >= H || h1 >= H {
                 return None;
             }
@@ -539,8 +512,8 @@ fn simulate_move_on_cols(
             if mv.x == 0 {
                 return None;
             }
-            let h0 = col_height_from_cols(cols, mv.x);
-            let h1 = col_height_from_cols(cols, mv.x - 1);
+            let h0 = heights[mv.x];
+            let h1 = heights[mv.x - 1];
             if h0 >= H || h1 >= H {
                 return None;
             }
@@ -621,8 +594,8 @@ fn cp_search_depth_limit(
     }
     let seq_len = pair_seq.len();
     let pair = pair_seq[start_index];
-    let moves = list_valid_moves(&cols);
-    let total = moves.len();
+    let heights = calc_col_heights(&cols);
+    let total = count_valid_moves(&heights);
     if total == 0 {
         let status = CpSearchStatus {
             depth_limit,
@@ -633,18 +606,19 @@ fn cp_search_depth_limit(
         let _ = tx.send(CpSearchMessage::Progress(status));
         return None;
     }
-    for (idx, mv) in moves.into_iter().enumerate() {
+    let mut branch_index = 0usize;
+    let try_move = |mv: CpMove, branch_index: usize| -> Option<(usize, CpMove)> {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
         let status = CpSearchStatus {
             depth_limit,
             depth: 1,
-            branch_index: idx + 1,
+            branch_index,
             branch_count: total,
         };
         let _ = tx.send(CpSearchMessage::Progress(status));
-        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, &heights, pair, mv) {
             if chain >= target {
                 return Some((1, mv));
             }
@@ -663,6 +637,71 @@ fn cp_search_depth_limit(
                 ) {
                     return Some((1 + rest, mv));
                 }
+            }
+        }
+        None
+    };
+    for x in 0..W {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Up,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Down,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Right,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x >= 1 && heights[x - 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Left,
+                },
+                branch_index,
+            ) {
+                return Some(found);
             }
         }
     }
@@ -685,8 +724,8 @@ fn cp_search_recursive(
     }
     let seq_len = pair_seq.len();
     let pair = pair_seq[pair_index];
-    let moves = list_valid_moves(&cols);
-    let total = moves.len();
+    let heights = calc_col_heights(&cols);
+    let total = count_valid_moves(&heights);
     if total == 0 {
         let status = CpSearchStatus {
             depth_limit: depth_limit_total,
@@ -697,18 +736,19 @@ fn cp_search_recursive(
         let _ = tx.send(CpSearchMessage::Progress(status));
         return None;
     }
-    for (idx, mv) in moves.into_iter().enumerate() {
+    let mut branch_index = 0usize;
+    let try_move = |mv: CpMove, branch_index: usize| -> Option<usize> {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
         let status = CpSearchStatus {
             depth_limit: depth_limit_total,
             depth: current_depth,
-            branch_index: idx + 1,
+            branch_index,
             branch_count: total,
         };
         let _ = tx.send(CpSearchMessage::Progress(status));
-        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, &heights, pair, mv) {
             if chain >= target {
                 return Some(1);
             }
@@ -727,6 +767,71 @@ fn cp_search_recursive(
                 ) {
                     return Some(1 + rest);
                 }
+            }
+        }
+        None
+    };
+    for x in 0..W {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Up,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Down,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Right,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x >= 1 && heights[x - 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Left,
+                },
+                branch_index,
+            ) {
+                return Some(found);
             }
         }
     }
