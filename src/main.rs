@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use dashmap::{DashMap, DashSet};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2};
@@ -335,6 +335,36 @@ struct AnimState {
     since: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Orient {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+#[derive(Clone, Copy)]
+struct CpMove {
+    x: usize,
+    orient: Orient,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpSearchStatus {
+    depth_limit: usize,
+    depth: usize,
+    branch_index: usize,
+    branch_count: usize,
+}
+
+enum CpSearchMessage {
+    DepthStart { depth_limit: usize },
+    Progress(CpSearchStatus),
+    Found { depth: usize, mv: CpMove },
+    Failed,
+    Cancelled,
+}
+
 // 連鎖生成モードのワーク
 struct ChainPlay {
     cols: [[u16; W]; 4],
@@ -347,6 +377,12 @@ struct ChainPlay {
     // アニメ表示用：消去直後の盤面と、落下後の次盤面
     erased_cols: Option<[[u16; W]; 4]>,
     next_cols: Option<[[u16; W]; 4]>,
+    search_rx: Option<Receiver<CpSearchMessage>>,
+    search_thread: Option<thread::JoinHandle<()>>,
+    search_cancel: Option<Arc<AtomicBool>>,
+    search_status: Option<CpSearchStatus>,
+    search_depth_limit: Option<usize>,
+    pending_target: Option<u32>,
 }
 
 impl Default for ChainPlay {
@@ -371,22 +407,14 @@ impl Default for ChainPlay {
             lock: false,
             erased_cols: None,
             next_cols: None,
+            search_rx: None,
+            search_thread: None,
+            search_cancel: None,
+            search_status: None,
+            search_depth_limit: None,
+            pending_target: None,
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Orient {
-    Up,
-    Right,
-    Down,
-    Left,
-}
-
-#[derive(Clone, Copy)]
-struct CpMove {
-    x: usize,
-    orient: Orient,
 }
 
 #[inline(always)]
@@ -463,6 +491,15 @@ where
     None
 }
 
+fn list_valid_moves(cols: &[[u16; W]; 4]) -> Vec<CpMove> {
+    let mut moves = Vec::new();
+    let _ = for_each_valid_move(cols, |mv| {
+        moves.push(mv);
+        Option::<()>::None
+    });
+    moves
+}
+
 fn simulate_move_on_cols(
     cols: &[[u16; W]; 4],
     pair: (u8, u8),
@@ -524,6 +561,176 @@ fn simulate_move_on_cols(
     }
 
     Some((chain, next))
+}
+
+fn cp_run_target_search(
+    cols: [[u16; W]; 4],
+    pair_seq: Vec<(u8, u8)>,
+    start_index: usize,
+    target: u32,
+    tx: Sender<CpSearchMessage>,
+    cancel: Arc<AtomicBool>,
+) {
+    if pair_seq.is_empty() {
+        let _ = tx.send(CpSearchMessage::Failed);
+        return;
+    }
+    let seq_len = pair_seq.len();
+    for depth_limit in 1..=seq_len {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(CpSearchMessage::Cancelled);
+            return;
+        }
+        if tx
+            .send(CpSearchMessage::DepthStart { depth_limit })
+            .is_err()
+        {
+            return;
+        }
+        if let Some((depth, mv)) = cp_search_depth_limit(
+            cols,
+            &pair_seq,
+            start_index,
+            depth_limit,
+            target,
+            &tx,
+            &cancel,
+        ) {
+            let _ = tx.send(CpSearchMessage::Found { depth, mv });
+            return;
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = tx.send(CpSearchMessage::Cancelled);
+    } else {
+        let _ = tx.send(CpSearchMessage::Failed);
+    }
+}
+
+fn cp_search_depth_limit(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    start_index: usize,
+    depth_limit: usize,
+    target: u32,
+    tx: &Sender<CpSearchMessage>,
+    cancel: &AtomicBool,
+) -> Option<(usize, CpMove)> {
+    if depth_limit == 0 || pair_seq.is_empty() {
+        return None;
+    }
+    let seq_len = pair_seq.len();
+    let pair = pair_seq[start_index];
+    let moves = list_valid_moves(&cols);
+    let total = moves.len();
+    if total == 0 {
+        let status = CpSearchStatus {
+            depth_limit,
+            depth: 1,
+            branch_index: 0,
+            branch_count: 0,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        return None;
+    }
+    for (idx, mv) in moves.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let status = CpSearchStatus {
+            depth_limit,
+            depth: 1,
+            branch_index: idx + 1,
+            branch_count: total,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
+            if chain >= target {
+                return Some((1, mv));
+            }
+            if depth_limit > 1 {
+                let next_index = (start_index + 1) % seq_len;
+                if let Some(rest) = cp_search_recursive(
+                    next_cols,
+                    pair_seq,
+                    next_index,
+                    depth_limit - 1,
+                    target,
+                    tx,
+                    cancel,
+                    depth_limit,
+                    2,
+                ) {
+                    return Some((1 + rest, mv));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cp_search_recursive(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    pair_index: usize,
+    depth_remaining: usize,
+    target: u32,
+    tx: &Sender<CpSearchMessage>,
+    cancel: &AtomicBool,
+    depth_limit_total: usize,
+    current_depth: usize,
+) -> Option<usize> {
+    if depth_remaining == 0 || pair_seq.is_empty() {
+        return None;
+    }
+    let seq_len = pair_seq.len();
+    let pair = pair_seq[pair_index];
+    let moves = list_valid_moves(&cols);
+    let total = moves.len();
+    if total == 0 {
+        let status = CpSearchStatus {
+            depth_limit: depth_limit_total,
+            depth: current_depth,
+            branch_index: 0,
+            branch_count: 0,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        return None;
+    }
+    for (idx, mv) in moves.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let status = CpSearchStatus {
+            depth_limit: depth_limit_total,
+            depth: current_depth,
+            branch_index: idx + 1,
+            branch_count: total,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
+            if chain >= target {
+                return Some(1);
+            }
+            if depth_remaining > 1 {
+                let next_index = (pair_index + 1) % seq_len;
+                if let Some(rest) = cp_search_recursive(
+                    next_cols,
+                    pair_seq,
+                    next_index,
+                    depth_remaining - 1,
+                    target,
+                    tx,
+                    cancel,
+                    depth_limit_total,
+                    current_depth + 1,
+                ) {
+                    return Some(1 + rest);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn install_japanese_fonts(ctx: &egui::Context) {
@@ -602,6 +809,7 @@ impl eframe::App for App {
         if self.mode == Mode::ChainPlay {
             self.cp_step_animation();
         }
+        self.cp_poll_search();
         // 受信メッセージ処理（安全：take→処理→必要なら戻す）
         if let Some(rx) = self.rx.take() {
             let mut keep_rx = true;
@@ -739,15 +947,20 @@ impl eframe::App for App {
                         });
 
                         ui.add_space(6.0);
-                        let can_ops = !self.cp.lock && self.cp.anim.is_none();
+                        let searching = self.cp_search_in_progress();
+                        let can_ops = !self.cp.lock && self.cp.anim.is_none() && !searching;
                         ui.horizontal(|ui| {
                             ui.label("目標連鎖数");
-                            ui.add(
+                            ui.add_enabled(
+                                !searching,
                                 egui::DragValue::new(&mut self.cp.target_chain)
                                     .clamp_range(1u32..=19u32)
                                     .speed(1.0),
                             );
-                            if ui.add_enabled(can_ops, egui::Button::new("目標配置")).clicked() {
+                            if ui
+                                .add_enabled(can_ops, egui::Button::new("目標配置"))
+                                .clicked()
+                            {
                                 self.cp_place_target();
                             }
                         });
@@ -762,7 +975,36 @@ impl eframe::App for App {
                                 self.cp_reset_to_initial();
                             }
                         });
-                        ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                        if searching {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                if let Some(status) = self.cp.search_status {
+                                    if status.branch_count > 0 {
+                                        ui.label(format!(
+                                            "探索中: 深さ制限{} / {}手目 ({} / {} 通り)",
+                                            status.depth_limit,
+                                            status.depth,
+                                            status.branch_index,
+                                            status.branch_count
+                                        ));
+                                    } else {
+                                        ui.label(format!(
+                                            "探索中: 深さ制限{} / {}手目 (有効手なし)",
+                                            status.depth_limit,
+                                            status.depth
+                                        ));
+                                    }
+                                } else if let Some(depth) = self.cp.search_depth_limit {
+                                    ui.label(format!("探索中: 深さ制限{} を走査中…", depth));
+                                } else if let Some(target) = self.cp.pending_target {
+                                    ui.label(format!("目標{}連鎖を探索中…", target));
+                                } else {
+                                    ui.label("探索中…");
+                                }
+                            });
+                        } else {
+                            ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                        }
                     });
                 }
 
@@ -907,7 +1149,14 @@ impl App {
         self.cp.pair_seq[idx]
     }
 
+    fn cp_search_in_progress(&self) -> bool {
+        self.cp.search_thread.is_some()
+    }
+
     fn cp_undo(&mut self) {
+        if self.cp_search_in_progress() {
+            return;
+        }
         if self.cp.undo_stack.len() > 1 && !self.cp.lock {
             self.cp.anim = None;
             self.cp.erased_cols = None;
@@ -923,6 +1172,9 @@ impl App {
     }
 
     fn cp_reset_to_initial(&mut self) {
+        if self.cp_search_in_progress() {
+            self.cp_cancel_search();
+        }
         if self.cp.lock {
             return;
         }
@@ -939,24 +1191,20 @@ impl App {
         self.cp.lock = false;
     }
 
-    fn cp_place_target(&mut self) {
-        if self.cp.lock || self.cp.anim.is_some() {
-            return;
+    fn cp_cancel_search(&mut self) {
+        if let Some(cancel) = &self.cp.search_cancel {
+            cancel.store(true, Ordering::Relaxed);
         }
-        if self.cp.pair_seq.is_empty() {
-            self.push_log("手順が設定されていません".into());
-            return;
-        }
-        let target = self.cp.target_chain.max(1);
-        let result = self.cp_find_target_move(target);
-        let Some((depth, mv)) = result else {
-            self.push_log(format!(
-                "目標{}連鎖に到達する配置が見つかりませんでした",
-                target
-            ));
-            return;
-        };
+    }
 
+    fn cp_finish_search_thread(&mut self) {
+        if let Some(handle) = self.cp.search_thread.take() {
+            let _ = handle.join();
+        }
+        self.cp.search_cancel = None;
+    }
+
+    fn cp_handle_search_found(&mut self, depth: usize, mv: CpMove) {
         // 事前スナップショット
         self.cp.undo_stack.push(SavedState {
             cols: self.cp.cols,
@@ -967,6 +1215,11 @@ impl App {
         self.cp_place_with(mv.x, mv.orient, pair);
         self.cp_check_and_start_chain();
 
+        let target = self
+            .cp
+            .pending_target
+            .take()
+            .unwrap_or_else(|| self.cp.target_chain.max(1));
         self.push_log(format!(
             "目標{}連鎖: 深さ{}で列{}{}に配置",
             target,
@@ -976,8 +1229,132 @@ impl App {
         ));
     }
 
+    fn cp_handle_search_failure(&mut self) {
+        let target = self
+            .cp
+            .pending_target
+            .take()
+            .unwrap_or_else(|| self.cp.target_chain.max(1));
+        self.push_log(format!(
+            "目標{}連鎖に到達する配置が見つかりませんでした",
+            target
+        ));
+    }
+
+    fn cp_handle_search_cancel(&mut self) {
+        if let Some(target) = self.cp.pending_target.take() {
+            self.push_log(format!("目標{}連鎖の探索を中断しました", target));
+        } else {
+            self.push_log("目標連鎖の探索を中断しました".into());
+        }
+    }
+
+    fn cp_poll_search(&mut self) {
+        if let Some(rx) = self.cp.search_rx.take() {
+            let mut keep_rx = true;
+            let mut finalize = false;
+            let mut receiver = Some(rx);
+            loop {
+                let Some(current) = receiver.as_ref() else {
+                    break;
+                };
+                match current.try_recv() {
+                    Ok(CpSearchMessage::DepthStart { depth_limit }) => {
+                        self.cp.search_depth_limit = Some(depth_limit);
+                        self.cp.search_status = None;
+                    }
+                    Ok(CpSearchMessage::Progress(status)) => {
+                        self.cp.search_depth_limit = Some(status.depth_limit);
+                        self.cp.search_status = Some(status);
+                    }
+                    Ok(CpSearchMessage::Found { depth, mv }) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_found(depth, mv);
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Ok(CpSearchMessage::Failed) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_failure();
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Ok(CpSearchMessage::Cancelled) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_cancel();
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp.pending_target = None;
+                        self.push_log("目標連鎖探索が異常終了しました".into());
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                }
+            }
+
+            if keep_rx {
+                if let Some(rx) = receiver {
+                    self.cp.search_rx = Some(rx);
+                }
+            }
+
+            if finalize {
+                self.cp_finish_search_thread();
+            }
+        }
+    }
+
+    fn cp_place_target(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() || self.cp_search_in_progress() {
+            return;
+        }
+        if self.cp.pair_seq.is_empty() {
+            self.push_log("手順が設定されていません".into());
+            return;
+        }
+
+        let target = self.cp.target_chain.max(1);
+        let len = self.cp.pair_seq.len();
+        let start_idx = self.cp.pair_index % len;
+        let cols = self.cp.cols;
+        let seq = self.cp.pair_seq.clone();
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            cp_run_target_search(cols, seq, start_idx, target, tx, cancel_thread);
+        });
+
+        self.cp.search_rx = Some(rx);
+        self.cp.search_thread = Some(handle);
+        self.cp.search_cancel = Some(cancel);
+        self.cp.search_status = None;
+        self.cp.search_depth_limit = None;
+        self.cp.pending_target = Some(target);
+
+        self.push_log(format!("目標{}連鎖の探索を開始", target));
+    }
+
     fn cp_place_random(&mut self) {
-        if self.cp.lock || self.cp.anim.is_some() {
+        if self.cp.lock || self.cp.anim.is_some() || self.cp_search_in_progress() {
             return;
         }
         // 事前スナップショット
@@ -1026,81 +1403,6 @@ impl App {
         self.cp_place_with(x, orient, pair);
         // 連鎖開始チェック
         self.cp_check_and_start_chain();
-    }
-
-    fn cp_find_target_move(&self, target: u32) -> Option<(usize, CpMove)> {
-        let len = self.cp.pair_seq.len();
-        if len == 0 {
-            return None;
-        }
-        let start_idx = self.cp.pair_index % len;
-        let cols = self.cp.cols;
-        for depth_limit in 1..=len {
-            if let Some(res) = self.cp_search_with_depth(cols, start_idx, depth_limit, target) {
-                return Some(res);
-            }
-        }
-        None
-    }
-
-    fn cp_search_with_depth(
-        &self,
-        cols: [[u16; W]; 4],
-        pair_index: usize,
-        depth_limit: usize,
-        target: u32,
-    ) -> Option<(usize, CpMove)> {
-        if depth_limit == 0 {
-            return None;
-        }
-        let seq_len = self.cp.pair_seq.len();
-        let pair = self.cp.pair_seq[pair_index];
-        for_each_valid_move(&cols, |mv| {
-            if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
-                if chain >= target {
-                    return Some((1, mv));
-                }
-                if depth_limit > 1 {
-                    let next_index = (pair_index + 1) % seq_len;
-                    if let Some(rest) =
-                        self.cp_search_recursive(next_cols, next_index, depth_limit - 1, target)
-                    {
-                        return Some((1 + rest, mv));
-                    }
-                }
-            }
-            None
-        })
-    }
-
-    fn cp_search_recursive(
-        &self,
-        cols: [[u16; W]; 4],
-        pair_index: usize,
-        depth_remaining: usize,
-        target: u32,
-    ) -> Option<usize> {
-        if depth_remaining == 0 {
-            return None;
-        }
-        let seq_len = self.cp.pair_seq.len();
-        let pair = self.cp.pair_seq[pair_index];
-        for_each_valid_move(&cols, |mv| {
-            if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, pair, mv) {
-                if chain >= target {
-                    return Some(1);
-                }
-                if depth_remaining > 1 {
-                    let next_index = (pair_index + 1) % seq_len;
-                    if let Some(rest) =
-                        self.cp_search_recursive(next_cols, next_index, depth_remaining - 1, target)
-                    {
-                        return Some(1 + rest);
-                    }
-                }
-            }
-            None
-        })
     }
 
     fn cp_place_with(&mut self, x: usize, orient: Orient, pair: (u8, u8)) {
