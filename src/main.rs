@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, BufReader, BufRead, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -17,7 +17,8 @@ use egui::{Color32, RichText, Vec2};
 use num_bigint::BigUint;
 use num_traits::{One, Zero, ToPrimitive};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
+use serde_json;
 use dashmap::{DashMap, DashSet};
 use rand::Rng;
 
@@ -40,6 +41,125 @@ enum Cell {
     Any4,    // 'X' (色のみ)
     Abs(u8), // 0..12 = 'A'..'M'
     Fixed(u8), // 0..=3 = '0'..'3' (RGBY固定)
+}
+
+// 方式B: 直前ステップ（最後の追加の直前）で既に free-top 列がE1で消える状態だったなら true
+#[inline(always)]
+fn precompleted_free_top_e1_on_last_step(
+    original: &[[u16; W]; 4],
+    additions: &Vec<(usize, u8)>,
+) -> bool {
+    let n = additions.len();
+    if n == 0 { return false; }
+    // 最終盤面
+    let merged_final = merge_additions_onto(*original, additions);
+    let clear_final = compute_erase_mask_cols(&merged_final);
+    let ft_final = first_clear_free_top_cols(&merged_final);
+
+    // 直前盤面（最後の追加を除く）
+    let mut pre_adds: Vec<(usize, u8)> = additions.clone();
+    pre_adds.pop();
+    let merged_pre = merge_additions_onto(*original, &pre_adds);
+    let clear_pre = compute_erase_mask_cols(&merged_pre);
+    let ft_pre = first_clear_free_top_cols(&merged_pre);
+
+    // final で free-top かつ E1 の列が、pre でも free-top かつ E1 なら「直前に既に完成していた」とみなす
+    for x in 0..W {
+        if ft_final[x] && (clear_final[x] & MASK14) != 0 {
+            if ft_pre[x] && (clear_pre[x] & MASK14) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn tie_break_cmp(a: (usize, Orient), b: (usize, Orient), board: &[[u16; W]; 4], policy: &TieBreakPolicy) -> std::cmp::Ordering {
+    if !policy.apply_initial { return std::cmp::Ordering::Equal; }
+    let ab = tie_break_choose(a, b, board, policy);
+    let ba = tie_break_choose(b, a, board, policy);
+    if ab && !ba { std::cmp::Ordering::Less }
+    else if ba && !ab { std::cmp::Ordering::Greater }
+    else { std::cmp::Ordering::Equal }
+}
+
+// 共通ヘルパー: 候補集合からタイブレーク規則に従って最良手を1つ選ぶ
+#[inline(always)]
+fn select_best_move(cands: &[(usize, Orient)], board: &[[u16; W]; 4], policy: &TieBreakPolicy) -> Option<(usize, Orient)> {
+    if cands.is_empty() { return None; }
+    let mut best = cands[0];
+    for &mv in &cands[1..] {
+        if tie_break_cmp(mv, best, board, policy) == std::cmp::Ordering::Less {
+            best = mv;
+        }
+    }
+    Some(best)
+}
+
+// 共通ヘルパー: スコア最大を優先し、同点ならタイブレーク
+#[inline(always)]
+fn select_best_scored_i32(cands: &[((usize, Orient), i32)], board: &[[u16; W]; 4], policy: &TieBreakPolicy) -> Option<(usize, Orient)> {
+    if cands.is_empty() { return None; }
+    let mut best = cands[0];
+    for &item in &cands[1..] {
+        if item.1 > best.1 {
+            best = item;
+        } else if item.1 == best.1 {
+            if tie_break_cmp(item.0, best.0, board, policy) == std::cmp::Ordering::Less {
+                best = item;
+            }
+        }
+    }
+    Some(best.0)
+}
+
+// 追加群のうち、「free-top 列」に置かれ、かつ E1 消去に参加しているセルが1つでもあれば true
+#[inline(always)]
+fn any_addition_on_free_top_involved_in_e1(
+    original: &[[u16; W]; 4],
+    additions: &Vec<(usize, u8)>,
+) -> bool {
+    if additions.is_empty() { return false; }
+    let merged = merge_additions_onto(*original, additions);
+    if count_first_clear_groups(&merged) == 0 || !first_clear_has_free_top(&merged) {
+        return false;
+    }
+    let ft = first_clear_free_top_cols(&merged);
+    let clear = compute_erase_mask_cols(&merged);
+    // 列ごとの追加の個数を数えながら y を算出
+    let mut per_col_counts = [0usize; W];
+    for &(cx, _color) in additions {
+        if cx >= W { continue; }
+        per_col_counts[cx] += 1;
+        let y = col_height(original, cx) + per_col_counts[cx] - 1;
+        if ft[cx] && (clear[cx] & (1u16 << y)) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// 1連鎖目で消える塊に対し、「その列の上に何も乗っていない」列を列挙
+#[inline(always)]
+fn first_clear_free_top_cols(cols: &[[u16; W]; 4]) -> [bool; W] {
+    let mut res = [false; W];
+    let clear = compute_erase_mask_cols(cols);
+    for x in 0..W {
+        let m = clear[x] & MASK14;
+        if m == 0 { continue; }
+        // この列の塊の最上段 y を求める
+        let mut top_y_opt = None;
+        for y in (0..H).rev() {
+            if (m & (1u16 << y)) != 0 { top_y_opt = Some(y); break; }
+        }
+        if let Some(top_y) = top_y_opt {
+            let occ = (cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & MASK14;
+            let above_mask: u16 = (!((1u16 << (top_y + 1)) - 1)) & MASK14;
+            if (occ & above_mask) == 0 { res[x] = true; }
+        }
+    }
+    res
 }
 
 #[inline(always)]
@@ -224,6 +344,8 @@ struct App {
 
     // 計測 ON/OFF
     profile_enabled: bool,
+    // 1連鎖目に free-top 列が1つ以上ある形に限定する
+    require_free_top_e1: bool,
 
     // 実行状態
     running: bool,
@@ -237,6 +359,9 @@ struct App {
     mode: Mode,
     // 連鎖生成モードの状態
     cp: ChainPlay,
+    // 連鎖生成（目標配置）: 非同期探索用
+    cp_rx: Option<Receiver<CpMessage>>, // 連鎖生成モード専用のメッセージ受信
+    cp_abort_flag: Arc<AtomicBool>,     // 連鎖生成モード専用の中断フラグ
 }
 
 #[derive(Default, Clone)]
@@ -280,6 +405,102 @@ enum Message {
     TimeDelta(TimeDelta),
 }
 
+// 連鎖生成（目標配置）専用メッセージ
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoundKind { TargetExact, Make3Group, MakeDiagonalSameColor, Make2Group, OneChainMaxGroup, FullClearFallback, JsonlPattern, JsonlAvoid }
+enum CpMessage {
+    Log(String),
+    Depth(usize),
+    Found { x: usize, orient: Orient, pair: (u8, u8), kind: FoundKind, fc_preview: Option<[[u16; W]; 4]>, fc_chain: Option<u32> },
+    // JSONL 形が完成したことの通知（以降、保全モジュールは停止するためのフラグに使う）
+    JsonlCompleted { key: String },
+    // 目指す JSONL 形の表示更新
+    TargetShape { rows: Vec<String>, key: String },
+    FinishedNone,
+    Error(String),
+}
+
+// 連鎖生成：配置制約（モジュール化）
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum CpConstraintKind {
+    // JSONL の形を目指す（最優先）。貢献手がなければ次の制約へ。
+    JsonlFollow,
+    // 0寄与かつ再検索でもヒットなしのとき、合致率が一定以上の形を保全するため、干渉（他色での上書き）を避ける手を採用
+    // しきい値はパーセント（0..=100）
+    JsonlAvoidInterfere { min_ratio_pct: u8 },
+    // 深さ 1..=max_depth の IDDFS で「＝ target」達成なら採用
+    TargetExactWithinDepth { max_depth: usize },
+    // 現在手で3連結を作れる手があれば採用（即時消去は避ける）
+    Make3GroupPrefer { avoid_diag_down23: bool },
+    // 現在手で、同色の斜め隣接を作れる手があれば採用（即時消去は避ける）
+    MakeDiagonalSameColorPrefer,
+    // 現在手で2連結を作れる手があれば採用（即時消去は避ける）
+    Make2GroupPrefer { avoid_diag_down23: bool },
+    // 1連鎖で発火し、かつ1連鎖目の連結サイズが最大となる手を優先（即時消去は必要条件）
+    OneChainMaxGroupPrefer { avoid_diag_down23: bool },
+    // 全消し検出（ビーム）で最大連鎖になる初手を採用
+    FullClearFallback { beam_depth: usize, beam_width: usize, pair_lookahead: usize },
+}
+
+// ── 同率タイ時の優先ルール ───────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TieBreakRule {
+    // 設置列の高さが低い方を優先（横置きは関与列の最小高さ）
+    MinPlacementHeight,
+    // 左端（xが小さい）を優先
+    LeftmostColumn,
+    // 垂直配置（Up/Down）を優先
+    PreferVertical,
+    // 同色の斜め隣接を優先（現在ペア色の情報がない場合は無効）
+    PreferDiagonalSameColor,
+    // 3連結を作る手を優先（直前盤面での斜め下2/3同色連結がある既存ぷよへの接続は避ける）
+    PreferMake3GroupAvoidDiagDown23,
+    // 2連結を作る手を優先（直前盤面での斜め下2/3同色連結がある既存ぷよへの接続は避ける）
+    PreferMake2GroupAvoidDiagDown23,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TieBreakPolicy {
+    // どの局面で適用するか（まずは初手選択のみ）
+    apply_initial: bool,
+    // 優先ルールの並び（上から順に適用）
+    rules: Vec<TieBreakRule>,
+}
+
+impl Default for TieBreakPolicy {
+    fn default() -> Self {
+        Self {
+            apply_initial: true,
+            rules: vec![
+                TieBreakRule::PreferDiagonalSameColor,
+                TieBreakRule::PreferMake3GroupAvoidDiagDown23,
+                TieBreakRule::PreferMake2GroupAvoidDiagDown23,
+                TieBreakRule::MinPlacementHeight,
+                TieBreakRule::LeftmostColumn,
+            ],
+        }
+    }
+}
+
+// 連鎖生成モジュール設定（保存用）
+#[derive(Serialize, Deserialize, Clone)]
+struct CpSettings {
+    constraints: Vec<CpConstraintKind>,
+    tie_break: TieBreakPolicy,
+}
+
+#[inline(always)]
+fn tie_rule_label(rule: TieBreakRule) -> &'static str {
+    match rule {
+        TieBreakRule::MinPlacementHeight => "最小設置列高を優先",
+        TieBreakRule::LeftmostColumn => "左端（xが小さい）を優先",
+        TieBreakRule::PreferVertical => "垂直配置を優先",
+        TieBreakRule::PreferDiagonalSameColor => "同色の斜め隣接を優先",
+        TieBreakRule::PreferMake3GroupAvoidDiagDown23 => "3連結を優先（斜め下2/3回避）",
+        TieBreakRule::PreferMake2GroupAvoidDiagDown23 => "2連結を優先（斜め下2/3回避）",
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         let mut board = vec![Cell::Blank; W * H];
@@ -298,6 +519,7 @@ impl Default for App {
             stop_progress_plateau: 0.0, // 無効（0.10などにすると有効）
             exact_four_only: false,
             profile_enabled: false,
+            require_free_top_e1: false,
             running: false,
             abort_flag: Arc::new(AtomicBool::new(false)),
             rx: None,
@@ -306,6 +528,8 @@ impl Default for App {
             log_lines: vec!["待機中".into()],
             mode: Mode::BruteForce,
             cp: ChainPlay::default(),
+            cp_rx: None,
+            cp_abort_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -316,6 +540,10 @@ enum Mode {
     BruteForce,
     ChainPlay,
 }
+
+// 連鎖生成：配置向き
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Orient { Up, Right, Down, Left }
 
 // 連鎖生成モード：保存状態
 #[derive(Clone, Copy)]
@@ -348,6 +576,26 @@ struct ChainPlay {
     // アニメ表示用：消去直後の盤面と、落下後の次盤面
     erased_cols: Option<[[u16; W]; 4]>,
     next_cols: Option<[[u16; W]; 4]>,
+    // 全消しプレビュー
+    best_preview: Option<[[u16; W]; 4]>,
+    best_chain: u32,
+    // 目標配置（探索）用
+    target_chain: u32,     // 目標連鎖数（＝で判定）
+    searching: bool,       // 探索中フラグ
+    search_depth: usize,   // 現在の探索深さ（UI表示）
+    last_found_kind: Option<FoundKind>, // 直前の採用理由
+    // 配置制約（適用順リスト）
+    constraints: Vec<CpConstraintKind>,
+    // 同率タイ時の優先ルール
+    tie_break: TieBreakPolicy,
+    // JSONL 追従: 現在の目標形（表示用）
+    target_shape_rows: Option<Vec<String>>, // 数字行列（1個除外済み）
+    target_shape_key: Option<String>,        // 元の key（抽象ラベル）
+    // JSONL ファイルパス（未設定なら out_path/out_name を使用）
+    jsonl_path: Option<std::path::PathBuf>,
+    // JSONL 完成検知（永続フラグ）
+    jsonl_completed: bool,
+    jsonl_completed_key: Option<String>,
 }
 
 impl Default for ChainPlay {
@@ -368,12 +616,33 @@ impl Default for ChainPlay {
             lock: false,
             erased_cols: None,
             next_cols: None,
+            best_preview: None,
+            best_chain: 0,
+            target_chain: 4,
+            searching: false,
+            search_depth: 0,
+            last_found_kind: None,
+            constraints: vec![
+                CpConstraintKind::JsonlFollow,
+                CpConstraintKind::JsonlAvoidInterfere { min_ratio_pct: 50 },
+                CpConstraintKind::TargetExactWithinDepth { max_depth: 5 },
+                CpConstraintKind::Make3GroupPrefer { avoid_diag_down23: true },
+                CpConstraintKind::MakeDiagonalSameColorPrefer,
+                CpConstraintKind::Make2GroupPrefer { avoid_diag_down23: true },
+                CpConstraintKind::OneChainMaxGroupPrefer { avoid_diag_down23: true },
+                CpConstraintKind::FullClearFallback { beam_depth: 8, beam_width: 16, pair_lookahead: 5 },
+            ],
+            tie_break: TieBreakPolicy::default(),
+            target_shape_rows: None,
+            target_shape_key: None,
+            jsonl_path: None,
+            jsonl_completed: false,
+            jsonl_completed_key: None,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Orient { Up, Right, Down, Left }
+// ...
 
 fn install_japanese_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
@@ -435,7 +704,7 @@ fn main() -> Result<()> {
         options,
         Box::new(|cc| {
             install_japanese_fonts(&cc.egui_ctx);
-            Box::new(App::default())
+            Box::new(App::new())
         }),
     )
     .map_err(|e| anyhow!("GUI起動に失敗: {e}"))
@@ -486,6 +755,81 @@ impl eframe::App for App {
             }
         }
 
+        // 連鎖生成（目標配置）: 受信メッセージ処理
+        if let Some(rx) = self.cp_rx.take() {
+            let mut keep_rx = true;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    CpMessage::Log(s) => self.push_log(s),
+                    CpMessage::Depth(d) => {
+                        self.cp.search_depth = d;
+                    }
+                    CpMessage::JsonlCompleted { key } => {
+                        self.cp.jsonl_completed = true;
+                        self.cp.jsonl_completed_key = Some(key.clone());
+                        self.cp.target_shape_rows = None;
+                        self.cp.target_shape_key = Some(key.clone());
+                        self.push_log(format!("目標配置: JSONL 形が完成（以降の保全は停止）: {}", key));
+                    }
+                    CpMessage::TargetShape { rows, key } => {
+                        self.cp.target_shape_rows = Some(rows);
+                        self.cp.target_shape_key = Some(key);
+                    }
+                    CpMessage::Found { x, orient, pair, kind, fc_preview, fc_chain } => {
+                        // 成功: 現在状態に適用（スナップショット→配置→連鎖チェック）
+                        self.cp.undo_stack.push(SavedState { cols: self.cp.cols, pair_index: self.cp.pair_index });
+                        self.cp_place_with(x, orient, pair);
+                        self.cp_check_and_start_chain();
+                        self.cp.last_found_kind = Some(kind);
+                        // フォールバック時は全消しプレビューも更新
+                        if let FoundKind::FullClearFallback = kind {
+                            if let Some(pv) = fc_preview { self.cp.best_preview = Some(pv); }
+                            if let Some(tc) = fc_chain { self.cp.best_chain = tc; }
+                        }
+                        // ログはリセット前の深さを利用
+                        let depth_shown = self.cp.search_depth;
+                        match kind {
+                            FoundKind::TargetExact => self.push_log(format!("目標配置: 深さ{}で目標＝{}連鎖を達成", depth_shown, self.cp.target_chain)),
+                            FoundKind::Make3Group => self.push_log("目標配置: 3連結を作成できる手を採用".into()),
+                            FoundKind::MakeDiagonalSameColor => self.push_log("目標配置: 同色の斜め隣接を作れる手を採用".into()),
+                            FoundKind::Make2Group => self.push_log("目標配置: 2連結を作成できる手を採用".into()),
+                            FoundKind::OneChainMaxGroup => self.push_log("目標配置: 1連鎖（最大連結）で発火".into()),
+                            FoundKind::FullClearFallback => self.push_log("目標配置: 目標未達 → 全消し検出の最大連鎖で配置（fallback）".into()),
+                            FoundKind::JsonlPattern => self.push_log("目標配置: JSONL 形に寄与する手を採用".into()),
+                            FoundKind::JsonlAvoid => self.push_log("目標配置: JSONL 形を邪魔しない手を採用".into()),
+                        }
+                        // JSONL 以外（ただし保全手 JsonlAvoid と、形保持の OneChainMaxGroup は除く）を採用した場合は目標形表示をクリア
+                        if kind != FoundKind::JsonlPattern && kind != FoundKind::JsonlAvoid && kind != FoundKind::OneChainMaxGroup {
+                            self.cp.target_shape_rows = None;
+                            self.cp.target_shape_key = None;
+                        }
+                        self.cp.searching = false;
+                        self.cp.search_depth = 0;
+                        self.cp_abort_flag.store(false, Ordering::Relaxed);
+                        keep_rx = false; // 終了
+                    }
+                    CpMessage::FinishedNone => {
+                        self.push_log("目標配置: 見つかりませんでした".into());
+                        // 目指す形をリセット
+                        self.cp.target_shape_rows = None;
+                        self.cp.target_shape_key = None;
+                        self.cp.searching = false;
+                        self.cp.search_depth = 0;
+                        self.cp_abort_flag.store(false, Ordering::Relaxed);
+                        keep_rx = false;
+                    }
+                    CpMessage::Error(e) => {
+                        self.push_log(format!("目標配置: エラー: {e}"));
+                        self.cp.searching = false;
+                        self.cp.search_depth = 0;
+                        self.cp_abort_flag.store(false, Ordering::Relaxed);
+                        keep_rx = false;
+                    }
+                }
+            }
+            if keep_rx { self.cp_rx = Some(rx); }
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("ぷよぷよ 連鎖形 総当たり（6×14）— Rust GUI（列ストリーミング＋LRU形キャッシュ＋並列化＋計測＋追撃最適化）");
             ui.horizontal(|ui| {
@@ -508,6 +852,7 @@ impl eframe::App for App {
                             ui.add(egui::DragValue::new(&mut self.threshold).clamp_range(1..=19).speed(0.1));
                             ui.label("連鎖閾値");
                             ui.add_space(8.0);
+                            // 同率タイ UI は連鎖生成モードに移動
                             ui.add(egui::DragValue::new(&mut self.lru_k).clamp_range(10..=1000).speed(1.0));
                             ui.label("形キャッシュ上限(千)");
                         });
@@ -524,6 +869,10 @@ impl eframe::App for App {
 
                         ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.exact_four_only, "4個消しモード（5個以上で消えたら除外）");
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.require_free_top_e1, "1連鎖目に free-top 列が1つ以上ある形に限定");
                         });
 
                         ui.horizontal_wrapped(|ui| {
@@ -586,17 +935,274 @@ impl eframe::App for App {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             let can_ops = !self.cp.lock && self.cp.anim.is_none();
-                            if ui.add_enabled(can_ops, egui::Button::new("ランダム配置")).clicked() {
+                            if ui.add_enabled(can_ops && !self.cp.searching, egui::Button::new("ランダム配置")).clicked() {
                                 self.cp_place_random();
                             }
-                            if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("戻る")).clicked() {
+                            if ui.add_enabled(can_ops && !self.cp.searching && self.cp.undo_stack.len() > 1, egui::Button::new("戻る")).clicked() {
                                 self.cp_undo();
                             }
-                            if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("初手に戻る")).clicked() {
+                            if ui.add_enabled(can_ops && !self.cp.searching, egui::Button::new("初手に戻る")).clicked() {
                                 self.cp_reset_to_initial();
                             }
                         });
-                        ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+
+                        // 目標連鎖数と探索操作
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.cp.target_chain).clamp_range(1..=19).speed(0.2));
+                            ui.label("目標連鎖数（＝で判定）");
+                            let can_ops = !self.cp.lock && self.cp.anim.is_none();
+                            if ui.add_enabled(can_ops && !self.cp.searching, egui::Button::new("目標配置")).clicked() {
+                                self.cp_start_target_search();
+                            }
+                            if ui.add_enabled(self.cp.searching, egui::Button::new("停止")).clicked() {
+                                self.cp_abort_flag.store(true, Ordering::Relaxed);
+                            }
+                            // JSONL ファイルの選択／解除
+                            if ui.add_enabled(!self.cp.searching, egui::Button::new("JSONL選択")).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("JSON Lines", &["jsonl"]).pick_file() {
+                                    self.cp.jsonl_path = Some(path.clone());
+                                    self.push_log(format!("JSONLを選択: {}", path.display()));
+                                }
+                            }
+                            if ui.add_enabled(!self.cp.searching && self.cp.jsonl_path.is_some(), egui::Button::new("JSONL解除")).clicked() {
+                                self.cp.jsonl_path = None;
+                                self.push_log("JSONL選択をクリア".into());
+                            }
+                        });
+                        // 現在のJSONL読み込み元の表示
+                        {
+                            let cur = if let Some(p) = &self.cp.jsonl_path {
+                                format!("選択中: {}", p.display())
+                            } else if let Some(dir) = &self.out_path {
+                                let d = dir.join(&self.out_name);
+                                format!("既定: {}", d.display())
+                            } else {
+                                format!("既定: {}", &self.out_name)
+                            };
+                            ui.label(egui::RichText::new(cur).small().color(Color32::GRAY));
+                        }
+                        if self.cp.searching {
+                            ui.label(format!("探索中… 深さ {}", self.cp.search_depth));
+                        } else {
+                            ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                        }
+                        if let Some(kind) = self.cp.last_found_kind {
+                            match kind {
+                                FoundKind::TargetExact => ui.label("直前: 目標連鎖＝達成で配置"),
+                                FoundKind::Make3Group => ui.label("直前: 3連結を作成できる手を採用"),
+                                FoundKind::MakeDiagonalSameColor => ui.label("直前: 同色の斜め隣接を作れる手を採用"),
+                                FoundKind::Make2Group => ui.label("直前: 2連結を作成できる手を採用"),
+                                FoundKind::OneChainMaxGroup => ui.label("直前: 1連鎖（最大連結）で発火"),
+                                FoundKind::FullClearFallback => ui.label("直前: 全消し検出の最大連鎖で配置（fallback）"),
+                                FoundKind::JsonlPattern => ui.label("直前: JSONL 形に寄与する手を採用"),
+                                FoundKind::JsonlAvoid => ui.label("直前: JSONL 形を邪魔しない手を採用"),
+                            };
+                        }
+                        ui.add_space(8.0);
+                        ui.group(|ui| {
+                            ui.label("配置制約（適用順）");
+                            let can_edit = !self.cp.searching && self.cp.anim.is_none() && !self.cp.lock;
+                            let len = self.cp.constraints.len();
+                            let mut move_up_idx: Option<usize> = None;
+                            let mut move_down_idx: Option<usize> = None;
+                            let mut new_constraints = self.cp.constraints.clone();
+                            for i in 0..len {
+                                let mut c = new_constraints[i];
+                                // 行ごとにユニークなID（インデックス）を使用して衝突回避
+                                ui.push_id(i, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(format!("{:>2}.", i + 1));
+                                        match c {
+                                            CpConstraintKind::JsonlFollow => {
+                                                ui.label("JSONLの形を目指す");
+                                            }
+                                            CpConstraintKind::JsonlAvoidInterfere { min_ratio_pct } => {
+                                                ui.label("JSONLを保全（干渉回避）");
+                                                let mut r = min_ratio_pct as i32;
+                                                let resp = ui.add_enabled(can_edit, egui::DragValue::new(&mut r).clamp_range(0..=100).speed(1.0));
+                                                if resp.changed() {
+                                                    let rr = r.clamp(0, 100) as u8;
+                                                    c = CpConstraintKind::JsonlAvoidInterfere { min_ratio_pct: rr };
+                                                }
+                                            }
+                                            CpConstraintKind::TargetExactWithinDepth { max_depth } => {
+                                                ui.label("目標＝達成（IDDFS）");
+                                                let mut md = max_depth as i32;
+                                                let resp = ui.add_enabled(can_edit, egui::DragValue::new(&mut md).clamp_range(1..=5).speed(0.1));
+                                                if resp.changed() {
+                                                    let md2 = md.clamp(1, 5) as usize;
+                                                    c = CpConstraintKind::TargetExactWithinDepth { max_depth: md2 };
+                                                }
+                                            }
+                                            CpConstraintKind::Make3GroupPrefer { avoid_diag_down23 } => {
+                                                ui.label("現在手で3連結を作る");
+                                                let mut av = avoid_diag_down23;
+                                                let resp = ui.checkbox(&mut av, "斜め下2/3同色がある既存ぷよへの連結を避ける");
+                                                if resp.changed() {
+                                                    c = CpConstraintKind::Make3GroupPrefer { avoid_diag_down23: av };
+                                                }
+                                            }
+                                            CpConstraintKind::MakeDiagonalSameColorPrefer => {
+                                                ui.label("現在手で同色の斜めを作る");
+                                            }
+                                            CpConstraintKind::Make2GroupPrefer { avoid_diag_down23 } => {
+                                                ui.label("現在手で2連結を作る");
+                                                let mut av = avoid_diag_down23;
+                                                let resp = ui.checkbox(&mut av, "斜め下2/3同色がある既存ぷよへの連結を避ける");
+                                                if resp.changed() {
+                                                    c = CpConstraintKind::Make2GroupPrefer { avoid_diag_down23: av };
+                                                }
+                                            }
+                                            CpConstraintKind::OneChainMaxGroupPrefer { avoid_diag_down23 } => {
+                                                ui.label("1連鎖（最大連結）で発火");
+                                                let mut av = avoid_diag_down23;
+                                                let resp = ui.checkbox(&mut av, "消去後にJSONL形に侵襲する落下を避ける");
+                                                if resp.changed() {
+                                                    c = CpConstraintKind::OneChainMaxGroupPrefer { avoid_diag_down23: av };
+                                                }
+                                            }
+                                            CpConstraintKind::FullClearFallback { beam_depth, beam_width, pair_lookahead } => {
+                                                ui.label("全消し検出（ビーム）");
+                                                ui.monospace("深さ:");
+                                                let mut bd = beam_depth as i32;
+                                                let bd_resp = ui.add_enabled(can_edit, egui::DragValue::new(&mut bd).clamp_range(1..=16).speed(0.1));
+                                                ui.monospace(" 幅:");
+                                                let mut bw = beam_width as i32;
+                                                let bw_resp = ui.add_enabled(can_edit, egui::DragValue::new(&mut bw).clamp_range(1..=64).speed(0.1));
+                                                ui.monospace(" 先読み手数(ペア):");
+                                                let mut pl = pair_lookahead as i32;
+                                                let pl_resp = ui.add_enabled(can_edit, egui::DragValue::new(&mut pl).clamp_range(0..=10).speed(0.1));
+                                                if bd_resp.changed() || bw_resp.changed() {
+                                                    let bd2 = bd.clamp(1, 16) as usize;
+                                                    let bw2 = bw.clamp(1, 64) as usize;
+                                                    c = CpConstraintKind::FullClearFallback { beam_depth: bd2, beam_width: bw2, pair_lookahead };
+                                                }
+                                                if pl_resp.changed() {
+                                                    let pl2 = pl.clamp(0, 10) as usize;
+                                                    c = match c { CpConstraintKind::FullClearFallback { beam_depth: bd2, beam_width: bw2, .. } => CpConstraintKind::FullClearFallback { beam_depth: bd2, beam_width: bw2, pair_lookahead: pl2 }, _ => c };
+                                                }
+                                            }
+                                        }
+                                        // 並べ替えボタン（スワップは後でまとめて）
+                                        if ui.add_enabled(can_edit && i > 0, egui::Button::new("↑")).clicked() {
+                                            move_up_idx = Some(i);
+                                        }
+                                        if ui.add_enabled(can_edit && i + 1 < len, egui::Button::new("↓")).clicked() {
+                                            move_down_idx = Some(i);
+                                        }
+                                    });
+                                });
+                                new_constraints[i] = c;
+                            }
+                            // ループ後にスワップを適用（途中で配列を変えない）
+                            if let Some(idx) = move_up_idx { new_constraints.swap(idx, idx - 1); }
+                            else if let Some(idx) = move_down_idx { new_constraints.swap(idx, idx + 1); }
+                            self.cp.constraints = new_constraints;
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(can_edit, egui::Button::new("デフォルト順に戻す")).clicked() {
+                                    self.cp.constraints = vec![
+                                        CpConstraintKind::TargetExactWithinDepth { max_depth: 5 },
+                                        CpConstraintKind::Make3GroupPrefer { avoid_diag_down23: true },
+                                        CpConstraintKind::MakeDiagonalSameColorPrefer,
+                                        CpConstraintKind::Make2GroupPrefer { avoid_diag_down23: true },
+                                        CpConstraintKind::OneChainMaxGroupPrefer { avoid_diag_down23: true },
+                                        CpConstraintKind::FullClearFallback { beam_depth: 8, beam_width: 16, pair_lookahead: 5 },
+                                    ];
+                                }
+                            });
+                        });
+                        // ── 同率タイ時の優先ルール ──────────────────────
+                        ui.group(|ui| {
+                            ui.label("同率タイ時の優先ルール");
+                            let can_edit = !self.cp.searching && self.cp.anim.is_none() && !self.cp.lock;
+                            ui.checkbox(&mut self.cp.tie_break.apply_initial, "初手選択時に適用");
+                            let len = self.cp.tie_break.rules.len();
+                            let mut move_up_idx: Option<usize> = None;
+                            let mut move_down_idx: Option<usize> = None;
+                            let mut remove_idx: Option<usize> = None;
+                            let mut new_rules = self.cp.tie_break.rules.clone();
+                            for i in 0..len {
+                                let mut r = new_rules[i];
+                                ui.push_id(format!("tie-rule-{}", i), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(format!("{:>2}.", i + 1));
+                                        egui::ComboBox::from_id_source("rule")
+                                            .selected_text(tie_rule_label(r))
+                                            .show_ui(ui, |ui| {
+                                                if ui.selectable_label(r == TieBreakRule::MinPlacementHeight, tie_rule_label(TieBreakRule::MinPlacementHeight)).clicked() { r = TieBreakRule::MinPlacementHeight; }
+                                                if ui.selectable_label(r == TieBreakRule::LeftmostColumn, tie_rule_label(TieBreakRule::LeftmostColumn)).clicked() { r = TieBreakRule::LeftmostColumn; }
+                                                if ui.selectable_label(r == TieBreakRule::PreferVertical, tie_rule_label(TieBreakRule::PreferVertical)).clicked() { r = TieBreakRule::PreferVertical; }
+                                                if ui.selectable_label(r == TieBreakRule::PreferDiagonalSameColor, tie_rule_label(TieBreakRule::PreferDiagonalSameColor)).clicked() { r = TieBreakRule::PreferDiagonalSameColor; }
+                                                if ui.selectable_label(r == TieBreakRule::PreferMake3GroupAvoidDiagDown23, tie_rule_label(TieBreakRule::PreferMake3GroupAvoidDiagDown23)).clicked() { r = TieBreakRule::PreferMake3GroupAvoidDiagDown23; }
+                                                if ui.selectable_label(r == TieBreakRule::PreferMake2GroupAvoidDiagDown23, tie_rule_label(TieBreakRule::PreferMake2GroupAvoidDiagDown23)).clicked() { r = TieBreakRule::PreferMake2GroupAvoidDiagDown23; }
+                                            });
+                                        if ui.add_enabled(can_edit && i > 0, egui::Button::new("↑")).clicked() { move_up_idx = Some(i); }
+                                        if ui.add_enabled(can_edit && i + 1 < len, egui::Button::new("↓")).clicked() { move_down_idx = Some(i); }
+                                        if ui.add_enabled(can_edit, egui::Button::new("×")).clicked() { remove_idx = Some(i); }
+                                    });
+                                });
+                                new_rules[i] = r;
+                            }
+                            if let Some(idx) = remove_idx { new_rules.remove(idx); }
+                            if let Some(idx) = move_up_idx { new_rules.swap(idx, idx - 1); }
+                            else if let Some(idx) = move_down_idx { new_rules.swap(idx, idx + 1); }
+                            self.cp.tie_break.rules = new_rules;
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(can_edit, egui::Button::new("追加")).clicked() {
+                                    self.cp.tie_break.rules.push(TieBreakRule::MinPlacementHeight);
+                                }
+                                if ui.add_enabled(can_edit, egui::Button::new("デフォルトに戻す")).clicked() {
+                                    self.cp.tie_break = TieBreakPolicy::default();
+                                }
+                                if ui.add_enabled(can_edit, egui::Button::new("設定を保存")).clicked() {
+                                    if let Err(e) = self.cp_save_settings() { self.push_log(format!("設定保存に失敗: {e}")); }
+                                }
+                                if ui.add_enabled(can_edit, egui::Button::new("設定を読込")).clicked() {
+                                    if let Err(e) = self.cp_load_settings() { self.push_log(format!("設定読込に失敗: {e}")); }
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("ルールの説明（隠れルール）")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("JSONL 追従").strong());
+                                ui.label("・表示用の形は、1連鎖目の free-top 列の最上段 1 セルを除外して判定します");
+                                ui.label("・即時消去が起きる手は除外します");
+                                ui.label("・注記: 除外セル（表示上の1セル）に置く場合は軽い減点（-10）があります");
+                                ui.label("・2個寄与が最優先。1個寄与の場合、もう1個は '.'（非ラベル）上にのみ配置します");
+                                ui.label("・既存/将来の同色直交連結でラベル領域に干渉する置き方は避けます");
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("JSONL 保全（干渉回避）").strong());
+                                ui.label("・寄与手が無い場合、合致率しきい値以上の形を保全する手を選びます（デフォルト 50%）");
+                                ui.label("・free-top 列の消去塊の最上段より上には置きません（前提崩しを回避）");
+                                ui.label("・'.' への配置を優先し、ラベル位置は既に割当済みの一致色のみ許容します");
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("free-top / E1 の一般ルール").strong());
+                                ui.label("・1連鎖目は単一グループかつ free-top 列が存在、最大連結サイズは 5 以下を重視します");
+                                ui.label("・自分の追加ぷよが free-top 列の E1 消去に参加してしまう候補は避けます");
+                                ui.label("・初手ペアが free-top E1 の消去成分に含まれる候補も避けます");
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("その他の制約").strong());
+                                ui.label("・目標＝達成（IDDFS）、3連結/2連結優先、同色斜め優先、1連鎖（最大連結）など");
+                                ui.label("・3/2連結優先では、既存ぷよの斜め下 2/3 同色への接続を避けるオプションがあります");
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("タイブレーク（デフォルト順）").strong());
+                                ui.label("・同色斜め優先 → 3連結優先（斜め下2/3回避） → 2連結優先（斜め下2/3回避） → 最小設置列高 → 左端");
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("4個消しモード").strong());
+                                ui.label("・初回消去が 4 以外なら不成立。E1 は空白隣接とオーバーハング条件を満たす必要があります");
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("全消しプレビュー更新").clicked() {
+                                self.cp_update_full_clear_preview();
+                            }
+                            if self.cp.best_preview.is_some() {
+                                ui.monospace(format!("MaxChain: {}", self.cp.best_chain));
+                            }
+                        });
                     });
                 }
 
@@ -715,6 +1321,23 @@ impl eframe::App for App {
                     ui.label("連鎖生成 — 盤面");
                     ui.add_space(6.0);
                     draw_preview(ui, &self.cp.cols);
+                    ui.add_space(12.0);
+                    ui.label("目標形（JSONL）");
+                    if let Some(rows) = &self.cp.target_shape_rows {
+                        let cols = rows_digits_to_cols(rows);
+                        draw_preview(ui, &cols);
+                    } else {
+                        ui.label(egui::RichText::new("（JSONL 形：未選択）").italics().color(Color32::GRAY));
+                    }
+                    ui.add_space(12.0);
+                    ui.label("全消しプレビュー");
+                    if let Some(pv) = &self.cp.best_preview {
+                        draw_preview(ui, pv);
+                    } else {
+                        ui.label(
+                            egui::RichText::new("（ボタンで更新）").italics().color(Color32::GRAY),
+                        );
+                    }
                 }
             });
         });
@@ -744,12 +1367,34 @@ impl App {
             self.cp.anim = None;
             self.cp.erased_cols = None;
             self.cp.next_cols = None;
-            if let Some(prev) = self.cp.undo_stack.pop() {
-                let _ = prev; // pop current snapshot
-            }
-            if let Some(last) = self.cp.undo_stack.last().copied() {
+            // スナップショットは「配置前」に push 済みなので、
+            // 直近のスナップショットそのものへ復元すれば 1 手 Undo になる。
+            if let Some(last) = self.cp.undo_stack.pop() {
                 self.cp.cols = last.cols;
                 self.cp.pair_index = last.pair_index;
+            }
+            // 戻る後の盤面で JSONL 完成状態を再評価（形キーがある場合のみ）
+            if let Some(ref pk) = self.cp.target_shape_key {
+                // JSONL パス（優先: 手動選択したファイル → 既定の出力先/ファイル名）
+                let jsonl_path = if let Some(p) = &self.cp.jsonl_path {
+                    p.clone()
+                } else if let Some(dir) = &self.out_path {
+                    dir.join(&self.out_name)
+                } else {
+                    std::path::PathBuf::from(&self.out_name)
+                };
+                if let Ok(entries) = load_jsonl_entries(&jsonl_path) {
+                    if let Some(ent) = entries.iter().find(|e| &e.key == pk) {
+                        let shape_cols = rows_digits_to_cols(&ent.pre_chain_board);
+                        if let Some((rx, ry)) = choose_removed_cell_for_display(&shape_cols) {
+                            let mut labels_mod = ent.labels.clone();
+                            labels_mod[ry][rx] = '.';
+                            let done = is_shape_fully_filled(&self.cp.cols, &labels_mod);
+                            self.cp.jsonl_completed = done;
+                            self.cp.jsonl_completed_key = if done { Some(ent.key.clone()) } else { None };
+                        }
+                    }
+                }
             }
         }
     }
@@ -759,13 +1404,31 @@ impl App {
         self.cp.anim = None;
         self.cp.erased_cols = None;
         self.cp.next_cols = None;
-        if let Some(first) = self.cp.undo_stack.first().copied() {
+        // 初手状態かどうか（スナップショットが初期のみ、かつ盤・インデックスが初期と一致）
+        let at_initial = if let Some(first) = self.cp.undo_stack.first().copied() {
+            self.cp.undo_stack.len() == 1 && self.cp.cols == first.cols && self.cp.pair_index == first.pair_index
+        } else { false };
+
+        if at_initial {
+            // 初手状態での「初手に戻る」→ ツモ列をランダム再生成
+            let mut rng = rand::thread_rng();
+            self.cp.pair_seq.clear();
+            for _ in 0..128 {
+                self.cp.pair_seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
+            }
+            self.push_log("ツモ列を再生成しました".into());
+            // 盤・インデックスはすでに初期と一致
+        } else if let Some(first) = self.cp.undo_stack.first().copied() {
+            // 通常の初手リセット
             self.cp.cols = first.cols;
             self.cp.pair_index = first.pair_index;
             // 初期スナップショットだけ残す
             self.cp.undo_stack.clear();
             self.cp.undo_stack.push(first);
         }
+        // JSONL 完成フラグは解除（完成誤認を避ける）
+        self.cp.jsonl_completed = false;
+        self.cp.jsonl_completed_key = None;
         self.cp.lock = false;
     }
 
@@ -872,6 +1535,25 @@ impl App {
         self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
     }
 
+    // ===== 全消しプレビュー更新 =====
+    fn cp_update_full_clear_preview(&mut self) {
+        // Python版 iterative_chain_clearing に相当するビームサーチを使用
+        let original = self.cp.cols;
+        let max_depth = 8usize;
+        let beam_width = 16usize;
+        if let Some((adds, total_chain)) = cp_iterative_chain_clearing_beam(original, max_depth, beam_width, None) {
+            let merged = merge_additions_onto(original, &adds);
+            self.cp.best_preview = Some(merged);
+            self.cp.best_chain = total_chain;
+        } else {
+            // 厳格条件を満たす解が見つからないときは、緩和版ビームでベストをプレビュー
+            let (adds, total_chain) = cp_iterative_chain_clearing_beam_relaxed(original, max_depth, beam_width);
+            let merged = merge_additions_onto(original, &adds);
+            self.cp.best_preview = Some(merged);
+            self.cp.best_chain = total_chain;
+        }
+    }
+
     fn cp_step_animation(&mut self) {
         let Some(anim) = self.cp.anim else { return; };
         let elapsed = anim.since.elapsed();
@@ -907,8 +1589,972 @@ impl App {
     }
 }
 
+// ===== 連鎖生成モード：目標配置（IDDFS 非同期探索） =====
+impl App {
+    fn cp_start_target_search(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() || self.cp.searching { return; }
+        // 準備
+        let original = self.cp.cols;
+        let pair_seq = self.cp.pair_seq.clone();
+        let pair_index = self.cp.pair_index;
+        let target = self.cp.target_chain.max(1);
+        let constraints = self.cp.constraints.clone();
+        let tie_break = self.cp.tie_break.clone();
+        let preferred_key = self.cp.target_shape_key.clone();
+        let jsonl_completed = self.cp.jsonl_completed;
+        let _jsonl_completed_key = self.cp.jsonl_completed_key.clone();
+        // JSONL パス（優先: 手動選択したファイル → 既定の出力先/ファイル名）
+        let jsonl_path = if let Some(p) = &self.cp.jsonl_path {
+            p.clone()
+        } else if let Some(dir) = &self.out_path {
+            dir.join(&self.out_name)
+        } else {
+            std::path::PathBuf::from(&self.out_name)
+        };
+        // 読み込み（UI スレッドで実行してから move）
+        let jsonl_entries = match load_jsonl_entries(&jsonl_path) {
+            Ok(v) => v,
+            Err(e) => {
+                self.push_log(format!("JSONL 読み込み失敗: {}", e));
+                Vec::new()
+            }
+        };
+
+        let (tx, rx) = unbounded::<CpMessage>();
+        self.cp_rx = Some(rx);
+        self.cp.searching = true;
+        self.cp.search_depth = 0;
+        self.cp_abort_flag.store(false, Ordering::Relaxed);
+
+        let abort = self.cp_abort_flag.clone();
+        thread::spawn(move || {
+            // 制約リストの順序で適用
+            let pair_len = pair_seq.len().max(1);
+            let start_pair = pair_seq[pair_index % pair_len];
+            let _ = tx.send(CpMessage::Log("目標配置探索を開始".into()));
+            // UI から受け取った JSONL 完成フラグ（ローカルコピー）
+            let mut jsonl_completed_flag = jsonl_completed;
+
+            for constraint in constraints.iter() {
+                if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                match *constraint {
+                    CpConstraintKind::JsonlFollow => {
+                        // 事前: JSONL 完成済みなら全スキップ
+                        let mut skip_jsonl = jsonl_completed_flag;
+                        // さらに、現在の優先形（表示中の形）が「free-top 最上段以外はすべて埋まっている」なら、このモジュールをスキップ
+                        if let Some(ref pk) = preferred_key {
+                            if let Some(ent_pk) = jsonl_entries.iter().find(|e| &e.key == pk) {
+                                let shape_cols = rows_digits_to_cols(&ent_pk.pre_chain_board);
+                                if let Some((rx, ry)) = choose_removed_cell_for_display(&shape_cols) {
+                                    let mut labels_mod = ent_pk.labels.clone();
+                                    labels_mod[ry][rx] = '.';
+                                    if !skip_jsonl && is_shape_fully_filled(&original, &labels_mod) {
+                                        skip_jsonl = true;
+                                        if !jsonl_completed_flag {
+                                            let _ = tx.send(CpMessage::JsonlCompleted { key: ent_pk.key.clone() });
+                                            jsonl_completed_flag = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if skip_jsonl { /* 次の制約へ */ } else {
+                        // 1) 形の候補を順に試し、現盤面から作成可能か（抽象ラベル）をチェック
+                        // 2) 最初に「寄与する手」が見つかった形を採用し、その場で Found を送って終了
+                        let mut found_any = false;
+                        // 優先: 前回選択した形
+                        let mut indices: Vec<usize> = (0..jsonl_entries.len()).collect();
+                        if let Some(ref pk) = preferred_key {
+                            if let Some(pos) = jsonl_entries.iter().position(|e| &e.key == pk) {
+                                if pos != 0 { indices.remove(pos); indices.insert(0, pos); }
+                            }
+                        }
+                        'shape_loop: for &i in indices.iter() {
+                            let ent = &jsonl_entries[i];
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            // pre_chain_board からビットボード
+                            let shape_cols = rows_digits_to_cols(&ent.pre_chain_board);
+                            // E1 の free-top 列から 1 個除外（表示用）
+                            let removed = choose_removed_cell_for_display(&shape_cols);
+                            if removed.is_none() { continue; }
+                            let removed = removed.unwrap();
+                            // ラベルグリッド（抽象ラベル）に除外を反映
+                            let mut labels_mod = ent.labels.clone();
+                            labels_mod[removed.1][removed.0] = '.';
+                            // 形が現盤面から作れるか（既存配置で矛盾がないか）
+                            if !pattern_compatible_with_board(&original, &labels_mod) { continue; }
+
+                            // 候補手をスコアリング
+                            let moves = cp_generate_moves_from_cols(&original);
+                            let mut scored: Vec<((usize, Orient), i32)> = Vec::new();
+                            for (x, orient) in moves {
+                                if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                                if let Some(((ax, ay), (bx, by))) = cp_positions_for_move(&original, x, orient) {
+                                    // 即時消去が起きる手はスキップ（形づくり優先）
+                                    let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                                    let clear = compute_erase_mask_cols(&after1);
+                                    if (0..W).any(|cx| clear[cx] != 0) { continue; }
+                                    let place_ok = evaluate_jsonl_contribution(
+                                        &original,
+                                        (ax, ay), (bx, by),
+                                        start_pair,
+                                        &labels_mod,
+                                        removed,
+                                    );
+                                    if let Some(score) = place_ok {
+                                        scored.push(((x, orient), score));
+                                    }
+                                }
+                            }
+                            if !scored.is_empty() {
+                                // UI に目標形を通知（この形で寄与可能なときのみ）
+                                let mut shown = ent.pre_chain_board.clone();
+                                let (rx, ry) = removed;
+                                if ry < shown.len() && rx < shown[ry].len() {
+                                    let mut row = shown[ry].chars().collect::<Vec<char>>();
+                                    row[rx] = '.';
+                                    shown[ry] = row.into_iter().collect();
+                                }
+                                let _ = tx.send(CpMessage::TargetShape { rows: shown.clone(), key: ent.key.clone() });
+                            }
+                            if let Some((bx, bo)) = select_best_scored_i32(&scored, &original, &tie_break) {
+                                let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::JsonlPattern, fc_preview: None, fc_chain: None });
+                                found_any = true;
+                                break 'shape_loop;
+                            }
+                            // 寄与手なし → 次の形を試す
+                        }
+                        if found_any { return; }
+                        }
+                        // 見つからなければ次の制約へフォールスルー
+                    }
+                    CpConstraintKind::JsonlAvoidInterfere { min_ratio_pct } => {
+                        // 事前: JSONL 完成済みなら全スキップ
+                        let mut skip_jsonl = jsonl_completed_flag;
+                        // さらに、現在の優先形（表示中の形）が「free-top 最上段以外はすべて埋まっている」なら、このモジュールをスキップ
+                        if let Some(ref pk) = preferred_key {
+                            if let Some(ent_pk) = jsonl_entries.iter().find(|e| &e.key == pk) {
+                                let shape_cols = rows_digits_to_cols(&ent_pk.pre_chain_board);
+                                if let Some((rx, ry)) = choose_removed_cell_for_display(&shape_cols) {
+                                    let mut labels_mod = ent_pk.labels.clone();
+                                    labels_mod[ry][rx] = '.';
+                                    if !skip_jsonl && is_shape_fully_filled(&original, &labels_mod) {
+                                        skip_jsonl = true;
+                                        if !jsonl_completed_flag {
+                                            let _ = tx.send(CpMessage::JsonlCompleted { key: ent_pk.key.clone() });
+                                            jsonl_completed_flag = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if skip_jsonl { /* 次の制約へ */ } else {
+                        // 形が全く寄与できない場合、現局面と合致率が高い形を保全するため、
+                        // その形を邪魔しない（他色でラベル位置を潰さない）手を選ぶ
+                        let mut best_move: Option<(usize, Orient, i32, usize)> = None; // (x,orient,score,shape_index)
+                        // 優先: 直前の形
+                        let mut indices: Vec<usize> = (0..jsonl_entries.len()).collect();
+                        if let Some(ref pk) = preferred_key {
+                            if let Some(pos) = jsonl_entries.iter().position(|e| &e.key == pk) {
+                                if pos != 0 { indices.remove(pos); indices.insert(0, pos); }
+                            }
+                        }
+                        for &i in indices.iter() {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            let ent = &jsonl_entries[i];
+                            // free-top 列から 1 個除外した形で保全を評価する
+                            let shape_cols = rows_digits_to_cols(&ent.pre_chain_board);
+                            let removed = if let Some(rc) = choose_removed_cell_for_display(&shape_cols) { rc } else { continue; };
+                            let mut labels_mod = ent.labels.clone();
+                            labels_mod[removed.1][removed.0] = '.';
+                            if let Some((col_to_label, label_to_col, ratio)) = compute_mapping_and_ratio(&original, &labels_mod) {
+                                if (ratio * 100.0) < (min_ratio_pct as f32) { continue; }
+                                // 候補手のうち、形に干渉しないものを評価
+                                let moves = cp_generate_moves_from_cols(&original);
+                                // free-top 列の top_y を計算（この上には置かない）
+                                let clear_shape = compute_erase_mask_cols(&shape_cols);
+                                let ft_shape = first_clear_free_top_cols(&shape_cols);
+                                let mut top_y: [Option<usize>; W] = [None; W];
+                                for x2 in 0..W {
+                                    if !ft_shape[x2] { continue; }
+                                    let m = clear_shape[x2] & MASK14;
+                                    if m == 0 { continue; }
+                                    for y2 in (0..H).rev() {
+                                        if (m & (1u16 << y2)) != 0 { top_y[x2] = Some(y2); break; }
+                                    }
+                                }
+                                for (x, orient) in moves {
+                                    if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                                    // 即時消去手は避ける
+                                    let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                                    let clear = compute_erase_mask_cols(&after1);
+                                    if (0..W).any(|cx| clear[cx] != 0) { continue; }
+                                    if let Some(((ax, ay), (bx, by))) = cp_positions_for_move(&original, x, orient) {
+                                        // free-top 列の上側には置かない（形の前提を壊さない）
+                                        if let Some(ty) = top_y[ax] { if ay > ty { continue; } }
+                                        if let Some(ty) = top_y[bx] { if by > ty { continue; } }
+                                        if move_avoids_interference(
+                                            &original, (ax, ay), (bx, by), start_pair, &labels_mod, &col_to_label, &label_to_col
+                                        ) {
+                                            // スコア: '.' に置くほど良い（完全回避を優先）
+                                            let mut sc = 0i32;
+                                            let la = labels_mod[ay][ax];
+                                            let lb = labels_mod[by][bx];
+                                            if la == '.' { sc += 10; } else { sc += 3; }
+                                            if lb == '.' { sc += 10; } else { sc += 3; }
+                                            match best_move {
+                                                None => best_move = Some((x, orient, sc, i)),
+                                                Some((_bx,_bo, bsc, _bi)) => {
+                                                    if sc > bsc || (sc == bsc && tie_break_choose_with_pair((x,orient), (_bx,_bo), &original, start_pair, &tie_break)) {
+                                                        best_move = Some((x, orient, sc, i));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((bx, bo, _sc, bi)) = best_move {
+                            // UI に保全対象の形を表示（free-top 列から1個除外した形）
+                            let ent = &jsonl_entries[bi];
+                            let shape_cols = rows_digits_to_cols(&ent.pre_chain_board);
+                            if let Some((rx, ry)) = choose_removed_cell_for_display(&shape_cols) {
+                                let mut shown = ent.pre_chain_board.clone();
+                                if ry < shown.len() && rx < shown[ry].len() {
+                                    let mut row = shown[ry].chars().collect::<Vec<char>>();
+                                    row[rx] = '.';
+                                    shown[ry] = row.into_iter().collect();
+                                }
+                                let _ = tx.send(CpMessage::TargetShape { rows: shown, key: ent.key.clone() });
+                            } else {
+                                // 念のためフォールバック（通常は到達しない）
+                                let _ = tx.send(CpMessage::TargetShape { rows: ent.pre_chain_board.clone(), key: ent.key.clone() });
+                            }
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::JsonlAvoid, fc_preview: None, fc_chain: None });
+                            return;
+                        }
+                        }
+                        // 見つからなければ次の制約へ
+                    }
+                    CpConstraintKind::TargetExactWithinDepth { max_depth } => {
+                        for depth in 1..=max_depth.max(1) {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            let _ = tx.send(CpMessage::Depth(depth));
+                            let moves = cp_generate_moves_from_cols(&original);
+                            let mut cands: Vec<(usize, Orient)> = Vec::new();
+                            for (x, orient) in moves {
+                                if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                                let after = cp_apply_move_pure(&original, x, orient, start_pair);
+                                let (gain, leftover) = simulate_chain_and_final(after);
+                                if gain == target { cands.push((x, orient)); continue; }
+                                if depth > 1 {
+                                    // 重要: 再帰には連鎖を解決した安定盤面（leftover）を渡す
+                                    if dfs_exact_reachable(leftover, &pair_seq, pair_index + 1, depth - 1, target, &abort) {
+                                        cands.push((x, orient));
+                                    }
+                                }
+                            }
+                            if let Some((bx, bo)) = select_best_move_with_pair(&cands, &original, start_pair, &tie_break) {
+                                let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::TargetExact, fc_preview: None, fc_chain: None });
+                                return;
+                            }
+                        }
+                    }
+                    CpConstraintKind::Make3GroupPrefer { avoid_diag_down23 } => {
+                        let moves = cp_generate_moves_from_cols(&original);
+                        let mut cands: Vec<(usize, Orient)> = Vec::new();
+                        for (x, orient) in moves {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            if let Some((pos_axis, pos_child)) = cp_positions_for_move(&original, x, orient) {
+                                let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                                // 即時消去が起きる手はスキップ
+                                let clear = compute_erase_mask_cols(&after1);
+                                if (0..W).any(|cx| clear[cx] != 0) { continue; }
+                                // 斜め下 2/3 連結回避オプション
+                                if avoid_diag_down23 {
+                                    // 既存ぷよへの連結を避けたい場合は、事前盤面 original で評価
+                                    if avoid_connect_if_neighbor_has_diag_down_23(&original, start_pair.0, pos_axis) { continue; }
+                                    if avoid_connect_if_neighbor_has_diag_down_23(&original, start_pair.1, pos_child) { continue; }
+                                }
+                                let sz_a = comp_size_for_color_at(&after1, start_pair.0, pos_axis.0, pos_axis.1);
+                                let sz_b = comp_size_for_color_at(&after1, start_pair.1, pos_child.0, pos_child.1);
+                                if sz_a == 3 || sz_b == 3 { cands.push((x, orient)); }
+                            }
+                        }
+                        if let Some((bx, bo)) = select_best_move_with_pair(&cands, &original, start_pair, &tie_break) {
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::Make3Group, fc_preview: None, fc_chain: None });
+                            return;
+                        }
+                    }
+                    CpConstraintKind::MakeDiagonalSameColorPrefer => {
+                        let moves = cp_generate_moves_from_cols(&original);
+                        let mut cands: Vec<(usize, Orient)> = Vec::new();
+                        for (x, orient) in moves {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                            // 即時消去が起きる手はスキップ
+                            let clear = compute_erase_mask_cols(&after1);
+                            if (0..W).any(|cx| clear[cx] != 0) { continue; }
+                            if diagonal_same_color_for_move(&original, x, orient, start_pair) {
+                                cands.push((x, orient));
+                            }
+                        }
+                        if let Some((bx, bo)) = select_best_move_with_pair(&cands, &original, start_pair, &tie_break) {
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::MakeDiagonalSameColor, fc_preview: None, fc_chain: None });
+                            return;
+                        }
+                    }
+                    CpConstraintKind::Make2GroupPrefer { avoid_diag_down23 } => {
+                        let moves = cp_generate_moves_from_cols(&original);
+                        let mut cands: Vec<(usize, Orient)> = Vec::new();
+                        for (x, orient) in moves {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            if let Some((pos_axis, pos_child)) = cp_positions_for_move(&original, x, orient) {
+                                let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                                // 即時消去が起きる手はスキップ
+                                let clear = compute_erase_mask_cols(&after1);
+                                if (0..W).any(|cx| clear[cx] != 0) { continue; }
+                                // 斜め下 2/3 連結回避オプション
+                                if avoid_diag_down23 {
+                                    if avoid_connect_if_neighbor_has_diag_down_23(&original, start_pair.0, pos_axis) { continue; }
+                                    if avoid_connect_if_neighbor_has_diag_down_23(&original, start_pair.1, pos_child) { continue; }
+                                }
+                                let sz_a = comp_size_for_color_at(&after1, start_pair.0, pos_axis.0, pos_axis.1);
+                                let sz_b = comp_size_for_color_at(&after1, start_pair.1, pos_child.0, pos_child.1);
+                                if sz_a == 2 || sz_b == 2 { cands.push((x, orient)); }
+                            }
+                        }
+                        if let Some((bx, bo)) = select_best_move_with_pair(&cands, &original, start_pair, &tie_break) {
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::Make2Group, fc_preview: None, fc_chain: None });
+                            return;
+                        }
+                    }
+                    CpConstraintKind::OneChainMaxGroupPrefer { avoid_diag_down23 } => {
+                        let moves = cp_generate_moves_from_cols(&original);
+                        // JSONL 形ガード用マスク（ラベル位置を1にする）。preferred_key がある場合のみ作る。
+                        let guard_mask_opt: Option<[u16; W]> = if avoid_diag_down23 {
+                            if let Some(ref pk) = preferred_key {
+                                if let Some(ent) = jsonl_entries.iter().find(|e| &e.key == pk) {
+                                    let mut mask = [0u16; W];
+                                    for y in 0..H { for x in 0..W { if ent.labels[y][x] != '.' { mask[x] |= 1u16 << y; } } }
+                                    Some(mask)
+                                } else { None }
+                            } else { None }
+                        } else { None };
+
+                        let mut scored: Vec<((usize, Orient), i32)> = Vec::new();
+                        for (x, orient) in moves {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            if cp_positions_for_move(&original, x, orient).is_none() { continue; }
+                            let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+                            // まず即時消去が必要
+                            let clear = compute_erase_mask_cols(&after1);
+                            if (0..W).all(|cx| clear[cx] == 0) { continue; }
+                            // 総連鎖数がちょうど 1 であること（落下まで反映）
+                            let (cc, final_board) = simulate_chain_and_final(after1);
+                            if cc != 1 { continue; }
+
+                            // JSONL 形への侵襲回避: 最終盤面で新規にラベル位置が埋まるなら拒否
+                            if let Some(guard) = guard_mask_opt {
+                                let mut invaded = false;
+                                for cx in 0..W {
+                                    let orig_occ = (original[0][cx] | original[1][cx] | original[2][cx] | original[3][cx]) & guard[cx];
+                                    let fin_occ  = (final_board[0][cx] | final_board[1][cx] | final_board[2][cx] | final_board[3][cx]) & guard[cx];
+                                    if (fin_occ & !orig_occ) != 0 { invaded = true; break; }
+                                }
+                                if invaded { continue; }
+                            }
+
+                            // スコア: 1連鎖目で消える塊の最大連結サイズ（after1 基準）
+                            let best_sz = first_clear_largest_size(&after1) as i32;
+                            scored.push(((x, orient), best_sz));
+                        }
+                        if let Some((bx, bo)) = select_best_scored_i32_with_pair(&scored, &original, start_pair, &tie_break) {
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::OneChainMaxGroup, fc_preview: None, fc_chain: None });
+                            return;
+                        }
+                    }
+                    CpConstraintKind::FullClearFallback { beam_depth, beam_width, pair_lookahead } => {
+                        let moves = cp_generate_moves_from_cols(&original);
+                        if moves.is_empty() { continue; }
+                        let mut best: Option<(usize, Orient, u32, Option<[[u16; W]; 4]>, Option<u32>)> = None;
+                        for (x, orient) in moves {
+                            if abort.load(Ordering::Relaxed) { let _ = tx.send(CpMessage::FinishedNone); return; }
+                            let first_pos = cp_positions_for_move(&original, x, orient);
+                            let after1 = cp_apply_move_pure(&original, x, orient, start_pair);
+
+                            // 初手（ペア）で E1 が発生し、かつ free-top 列の上に直置きして完成させる手は回避
+                            if let Some(((ax, ay), (bx, by))) = first_pos {
+                                let clear = compute_erase_mask_cols(&after1);
+                                let groups = count_first_clear_groups(&after1);
+                                if groups >= 1 && first_clear_has_free_top(&after1) {
+                                    let ft = first_clear_free_top_cols(&after1);
+                                    let abit = 1u16 << ay;
+                                    let bbit = 1u16 << by;
+                                    let a_on_clear = (clear[ax] & abit) != 0;
+                                    let b_on_clear = (clear[bx] & bbit) != 0;
+                                    if (ft[ax] && a_on_clear) || (ft[bx] && b_on_clear) {
+                                        // この候補はスキップ
+                                        continue;
+                                    }
+                                }
+                            }
+                            let (score, fc_prev, fc_tc) = if pair_lookahead > 0 {
+                                cp_evaluate_with_pair_lookahead(
+                                    after1,
+                                    &pair_seq,
+                                    pair_index + 1,
+                                    pair_lookahead,
+                                    beam_depth.max(1),
+                                    beam_width.max(1),
+                                    &abort,
+                                    first_pos,
+                                )
+                            } else if let Some((adds, total_chain)) = cp_iterative_chain_clearing_beam(after1, beam_depth.max(1), beam_width.max(1), first_pos) {
+                                let merged = merge_additions_onto(after1, &adds);
+                                (total_chain, Some(merged), Some(total_chain))
+                            } else {
+                                (simulate_chain_count_simple(after1), None, None)
+                            };
+                            match &mut best {
+                                None => best = Some((x, orient, score, fc_prev, fc_tc)),
+                                Some((cbx, cbo, bs, _bpv, _btc)) => {
+                                    if score > *bs {
+                                        *bs = score; best = Some((x, orient, score, fc_prev, fc_tc));
+                                    } else if score == *bs && tie_break.apply_initial {
+                                        // タイブレーク適用（trueなら新候補に置き換える）
+                                        if tie_break_choose_with_pair((x, orient), (*cbx, *cbo), &original, start_pair, &tie_break) {
+                                            best = Some((x, orient, score, fc_prev, fc_tc));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((bx, bo, _sc, bpv, btc)) = best {
+                            let _ = tx.send(CpMessage::Found { x: bx, orient: bo, pair: start_pair, kind: FoundKind::FullClearFallback, fc_preview: bpv, fc_chain: btc });
+                            return;
+                        }
+                    }
+                }
+            }
+            // どの制約でも見つからず
+            let _ = tx.send(CpMessage::FinishedNone);
+        });
+    }
+}
+
+// ===== JSONL 形 追従の実装補助 =====
+
+#[derive(Deserialize, Clone)]
+struct JsonlLineIn {
+    key: String,
+    hash: u32,
+    chains: u32,
+    pre_chain_board: Vec<String>,
+    example_mapping: HashMap<char, u8>,
+    mirror: bool,
+}
+
+#[derive(Clone)]
+struct JsonlEntry {
+    key: String,
+    pre_chain_board: Vec<String>,
+    labels: Vec<Vec<char>>, // H rows × W cols, from key ('.' or 'A'..) and de-mirrored to match rows
+}
+
+fn load_jsonl_entries(path: &std::path::Path) -> Result<Vec<JsonlEntry>> {
+    if !path.exists() { return Ok(Vec::new()); }
+    let f = File::open(path).with_context(|| format!("JSONL を開けませんでした: {}", path.display()))?;
+    let rdr = BufReader::new(f);
+    let mut out = Vec::new();
+    for line in rdr.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        let v: JsonlLineIn = serde_json::from_str(&line)
+            .with_context(|| "JSONL 1行の解析に失敗")?;
+        let mut labels = key_to_label_grid(&v.key);
+        // key は canonical orientation（mirror 適用済み）のため、rows と合わせるには mirror=true の場合に左右反転する
+        if v.mirror {
+            for y in 0..H {
+                labels[y].reverse();
+            }
+        }
+        out.push(JsonlEntry { key: v.key, pre_chain_board: v.pre_chain_board, labels });
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+fn key_to_label_grid(key: &str) -> Vec<Vec<char>> {
+    // key は x 外側, y 内側で push されている（encode_canonical_string 参照）
+    let mut grid = vec![vec!['.'; W]; H];
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() != W * H { return grid; }
+    for x in 0..W {
+        for y in 0..H {
+            let idx = x * H + y;
+            grid[y][x] = chars[idx];
+        }
+    }
+    grid
+}
+
+#[inline(always)]
+fn rows_digits_to_cols(rows: &Vec<String>) -> [[u16; W]; 4] {
+    let mut out = [[0u16; W]; 4];
+    let hh = rows.len().min(H);
+    for y in 0..hh {
+        let row = rows[y].as_bytes();
+        for x in 0..W.min(row.len()) {
+            let ch = row[x];
+            if ch >= b'0' && ch <= b'3' {
+                let c = (ch - b'0') as usize;
+                out[c][x] |= 1u16 << y;
+            }
+        }
+    }
+    out
+}
+
+#[inline(always)]
+fn pattern_compatible_with_board(board: &[[u16; W]; 4], labels: &Vec<Vec<char>>) -> bool {
+    let mut col_to_label: HashMap<u8, char> = HashMap::new();
+    let mut label_to_col: HashMap<char, u8> = HashMap::new();
+    for x in 0..W {
+        for y in 0..H {
+            let bit = 1u16 << y;
+            let mut c_opt: Option<u8> = None;
+            for c in 0..4 { if (board[c][x] & bit) != 0 { c_opt = Some(c as u8); break; } }
+            if let Some(c) = c_opt {
+                let lab = labels[y][x];
+                if lab == '.' { continue; }
+                if let Some(&l0) = col_to_label.get(&c) { if l0 != lab { return false; } } else {
+                    if let Some(&c0) = label_to_col.get(&lab) { if c0 != c { return false; } }
+                    col_to_label.insert(c, lab);
+                    label_to_col.insert(lab, c);
+                }
+            }
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn choose_removed_cell_for_display(cols: &[[u16; W]; 4]) -> Option<(usize, usize)> {
+    // 1連鎖目の free-top 列から、消える塊のうち一番上の 1 個を除外
+    let clear = compute_erase_mask_cols(cols);
+    if !first_clear_has_free_top(cols) { return None; }
+    let ft = first_clear_free_top_cols(cols);
+    for x in 0..W {
+        if !ft[x] { continue; }
+        let mut col_mask = clear[x] & MASK14;
+        if col_mask == 0 { continue; }
+        // 最上段（y の大きい）を選ぶ
+        let mut sel_y: Option<usize> = None;
+        for y in (0..H).rev() {
+            if (col_mask & (1u16 << y)) != 0 { sel_y = Some(y); break; }
+        }
+        if let Some(y) = sel_y { return Some((x, y)); }
+    }
+    None
+}
+
+// 評価: JSONL 形への寄与スコアを返す（なければ None）
+// ルール: 2個寄与=OK、1個寄与=もう1個は形の '.' 上に置くこと
+// スコア: 2個寄与=100、1個寄与=40、さらに除外セルを埋めるなら +20
+#[inline(always)]
+fn evaluate_jsonl_contribution(
+    board: &[[u16; W]; 4],
+    pos_a: (usize, usize),
+    pos_b: (usize, usize),
+    pair: (u8, u8),
+    labels: &Vec<Vec<char>>, // from key
+    removed_cell: (usize, usize),
+) -> Option<i32> {
+    // 既存配置との整合性をマップに反映
+    let mut col_to_label: HashMap<u8, char> = HashMap::new();
+    let mut label_to_col: HashMap<char, u8> = HashMap::new();
+    for x in 0..W {
+        for y in 0..H {
+            let bit = 1u16 << y;
+            for c in 0..4 {
+                if (board[c][x] & bit) != 0 {
+                    let lab = labels[y][x];
+                    if lab == '.' { continue; }
+                    let cu = c as u8;
+                    if let Some(&l0) = col_to_label.get(&cu) { if l0 != lab { return None; } } else {
+                        if let Some(&c0) = label_to_col.get(&lab) { if c0 != cu { return None; } }
+                        col_to_label.insert(cu, lab);
+                        label_to_col.insert(lab, cu);
+                    }
+                }
+            }
+        }
+    }
+
+    // 置き先のラベル
+    let (ax, ay) = pos_a; let (bx, by) = pos_b;
+    let la = labels[ay][ax];
+    let lb = labels[by][bx];
+    let a_is_label = la != '.';
+    let b_is_label = lb != '.';
+
+    // 2個寄与
+    if a_is_label && b_is_label {
+        if !unify_color_label(pair.0, la, &mut col_to_label, &mut label_to_col) { return None; }
+        if !unify_color_label(pair.1, lb, &mut col_to_label, &mut label_to_col) { return None; }
+        // removed_cell は表示上の除外候補。原則として避ける（軽いペナルティ）。
+        let mut score = 100;
+        if (ax, ay) == removed_cell || (bx, by) == removed_cell { score -= 10; }
+        return Some(score);
+    }
+    // 1個寄与: もう1つは '.' 上に置く
+    if a_is_label ^ b_is_label {
+        let (px, py, col, lab, other, other_col) = if a_is_label { (ax, ay, pair.0, la, (bx, by), pair.1) } else { (bx, by, pair.1, lb, (ax, ay), pair.0) };
+        // other はパターン '.' である必要
+        if labels[other.1][other.0] != '.' { return None; }
+        if !unify_color_label(col, lab, &mut col_to_label, &mut label_to_col) { return None; }
+        // '.' へ置く側が、既存の形（ラベル領域に既に置かれている同色）に直交隣接して連結しないこと
+        if connects_to_shape(board, labels, other.0, other.1, other_col) { return None; }
+        // 将来その隣接ラベルが同色になり得て連結してしまう置き方も避ける
+        if would_future_connect_to_shape(labels, other.0, other.1, other_col, &col_to_label, &label_to_col) { return None; }
+        // removed_cell は避ける（軽いペナルティ）
+        let mut score = 40;
+        if (px, py) == removed_cell { score -= 10; }
+        return Some(score);
+    }
+    None
+}
+
+#[inline(always)]
+fn unify_color_label(col: u8, lab: char, col_to_label: &mut HashMap<u8, char>, label_to_col: &mut HashMap<char, u8>) -> bool {
+    if let Some(&l0) = col_to_label.get(&col) { if l0 != lab { return false; } } else {
+        if let Some(&c0) = label_to_col.get(&lab) { if c0 != col { return false; } }
+        col_to_label.insert(col, lab);
+        label_to_col.insert(lab, col);
+    }
+    true
+}
+
+// 既存盤面に基づいて、色<->ラベルの対応を構築し、合致率を返す
+// 合致率 = 「ラベル付きセルのうち、現在すでに正しい色が置かれている数」/「現在ラベル付きセルに置かれている総数」
+// 一貫した対応が作れない場合は None
+fn compute_mapping_and_ratio(
+    board: &[[u16; W]; 4],
+    labels: &Vec<Vec<char>>,
+) -> Option<(HashMap<u8, char>, HashMap<char, u8>, f32)> {
+    let mut col_to_label: HashMap<u8, char> = HashMap::new();
+    let mut label_to_col: HashMap<char, u8> = HashMap::new();
+    // まず対応を構築（占有かつラベル付きセルのみ）
+    for x in 0..W {
+        for y in 0..H {
+            let lab = labels[y][x];
+            if lab == '.' { continue; }
+            let bit = 1u16 << y;
+            let mut color_opt: Option<u8> = None;
+            for c in 0..4 {
+                if (board[c][x] & bit) != 0 { color_opt = Some(c as u8); break; }
+            }
+            if let Some(col) = color_opt {
+                // 一貫性チェック
+                if let Some(&l0) = col_to_label.get(&col) { if l0 != lab { return None; } }
+                if let Some(&c0) = label_to_col.get(&lab) { if c0 != col { return None; } }
+                col_to_label.insert(col, lab);
+                label_to_col.insert(lab, col);
+            }
+        }
+    }
+    // 分母・分子の計算
+    let mut denom: u32 = 0;
+    let mut num: u32 = 0;
+    for x in 0..W {
+        for y in 0..H {
+            let lab = labels[y][x];
+            if lab == '.' { continue; }
+            let bit = 1u16 << y;
+            let mut color_opt: Option<u8> = None;
+            for c in 0..4 {
+                if (board[c][x] & bit) != 0 { color_opt = Some(c as u8); break; }
+            }
+            if let Some(col) = color_opt {
+                denom += 1;
+                if let Some(&mapped_col) = label_to_col.get(&lab) {
+                    if mapped_col == col { num += 1; }
+                }
+            }
+        }
+    }
+    if denom == 0 { return None; }
+    let ratio = num as f32 / denom as f32;
+    Some((col_to_label, label_to_col, ratio))
+}
+
+// 形への干渉を避ける手かどうかを判定
+// ポリシー: '.' には自由に置いて良い。ラベル位置には、既に割当済みの色で置く場合のみ許容。
+// ラベルにまだ割当が無い場合は、そのラベル位置へは置かない（干渉リスクを避ける）。
+#[inline(always)]
+fn connects_to_shape(board: &[[u16; W]; 4], labels: &Vec<Vec<char>>, x: usize, y: usize, color: u8) -> bool {
+    let dirs: &[(isize, isize)] = &[(-1,0),(1,0),(0,-1),(0,1)];
+    for (dx, dy) in dirs {
+        let nx = x as isize + dx;
+        let ny = y as isize + dy;
+        if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { continue; }
+        let (nxu, nyu) = (nx as usize, ny as usize);
+        if labels[nyu][nxu] == '.' { continue; }
+        let bit = 1u16 << nyu;
+        if (board[color as usize][nxu] & bit) != 0 { return true; }
+    }
+    false
+}
+
+// 未来にそのラベルへ同色が割り当てられ得るなら（＝将来的に直交隣接で連結し得るなら）true
+#[inline(always)]
+fn would_future_connect_to_shape(
+    labels: &Vec<Vec<char>>,
+    x: usize,
+    y: usize,
+    color: u8,
+    col_to_label: &HashMap<u8, char>,
+    label_to_col: &HashMap<char, u8>,
+) -> bool {
+    let dirs: &[(isize, isize)] = &[(-1,0),(1,0),(0,-1),(0,1)];
+    for (dx, dy) in dirs {
+        let nx = x as isize + dx;
+        let ny = y as isize + dy;
+        if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { continue; }
+        let (nxu, nyu) = (nx as usize, ny as usize);
+        let lab = labels[nyu][nxu];
+        if lab == '.' { continue; }
+        if let Some(&mc) = label_to_col.get(&lab) {
+            if mc == color { return true; }
+        } else {
+            // ラベル未割当。color が他ラベルに固定されていなければ、このラベルに将来割り当てられ得る
+            if let Some(&mlab) = col_to_label.get(&color) {
+                if mlab == lab { return true; } // 既にこのラベルに紐付く色
+            } else {
+                // color も未使用 → このラベルへ割当可能性あり
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn move_avoids_interference(
+    board: &[[u16; W]; 4],
+    pos_a: (usize, usize),
+    pos_b: (usize, usize),
+    pair: (u8, u8),
+    labels: &Vec<Vec<char>>,
+    col_to_label: &HashMap<u8, char>,
+    label_to_col: &HashMap<char, u8>,
+) -> bool {
+    let (ax, ay) = pos_a; let (bx, by) = pos_b;
+    let la = labels[ay][ax];
+    let lb = labels[by][bx];
+    // A 側: ラベル位置には置かない（完全に干渉を避ける）
+    if la != '.' { return false; }
+    // B 側
+    if lb != '.' { return false; }
+    // '.' へ置く場合でも、同色で JSONL ラベル領域に隣接（直交）して連結するのは避ける
+    if connects_to_shape(board, labels, ax, ay, pair.0) { return false; }
+    if connects_to_shape(board, labels, bx, by, pair.1) { return false; }
+    // 将来、その隣接ラベルが同色になり得て連結してしまう置き方も避ける
+    if would_future_connect_to_shape(labels, ax, ay, pair.0, col_to_label, label_to_col) { return false; }
+    if would_future_connect_to_shape(labels, bx, by, pair.1, col_to_label, label_to_col) { return false; }
+    true
+}
+
+// labels（表示用の1個除外適用済み）に対し、全ラベル位置へ既に正しい色が置かれているか
+// すべて埋まっていれば true（＝ 形は「free-top 最上段以外がすでに埋まった」状態）
+fn is_shape_fully_filled(board: &[[u16; W]; 4], labels: &Vec<Vec<char>>) -> bool {
+    let mut col_to_label: HashMap<u8, char> = HashMap::new();
+    let mut label_to_col: HashMap<char, u8> = HashMap::new();
+    for x in 0..W {
+        for y in 0..H {
+            let lab = labels[y][x];
+            if lab == '.' { continue; }
+            let bit = 1u16 << y;
+            let mut color_opt: Option<u8> = None;
+            for c in 0..4 { if (board[c][x] & bit) != 0 { color_opt = Some(c as u8); break; } }
+            let Some(col) = color_opt else { return false; };
+            if !unify_color_label(col, lab, &mut col_to_label, &mut label_to_col) { return false; }
+        }
+    }
+    true
+}
+
+// 単手の合法手を列挙（最大 22 通り）
+fn cp_generate_moves_from_cols(cols: &[[u16; W]; 4]) -> Vec<(usize, Orient)> {
+    let mut moves: Vec<(usize, Orient)> = Vec::new();
+    for x in 0..W {
+        let h = col_height(cols, x);
+        if h + 1 < H {
+            moves.push((x, Orient::Up));
+            moves.push((x, Orient::Down));
+        }
+        if x + 1 < W {
+            let h0 = h;
+            let h1 = col_height(cols, x + 1);
+            if h0 < H && h1 < H { moves.push((x, Orient::Right)); }
+        }
+        if x >= 1 {
+            let h0 = h;
+            let h1 = col_height(cols, x - 1);
+            if h0 < H && h1 < H { moves.push((x, Orient::Left)); }
+        }
+    }
+    moves
+}
+
+// 純関数版の配置適用（UI状態を変更しない）
+fn cp_apply_move_pure(cols: &[[u16; W]; 4], x: usize, orient: Orient, pair: (u8, u8)) -> [[u16; W]; 4] {
+    let mut out = *cols;
+    match orient {
+        Orient::Up => {
+            let h = col_height(&out, x);
+            if h < H { out[pair.0 as usize][x] |= 1u16 << h; }
+            if h + 1 < H { out[pair.1 as usize][x] |= 1u16 << (h + 1); }
+        }
+        Orient::Down => {
+            let h = col_height(&out, x);
+            if h < H { out[pair.1 as usize][x] |= 1u16 << h; }
+            if h + 1 < H { out[pair.0 as usize][x] |= 1u16 << (h + 1); }
+        }
+        Orient::Right => {
+            let h0 = col_height(&out, x);
+            let h1 = if x + 1 < W { col_height(&out, x + 1) } else { H };
+            if h0 < H { out[pair.0 as usize][x] |= 1u16 << h0; }
+            if x + 1 < W && h1 < H { out[pair.1 as usize][x + 1] |= 1u16 << h1; }
+        }
+        Orient::Left => {
+            let h0 = col_height(&out, x);
+            let h1 = if x >= 1 { col_height(&out, x - 1) } else { H };
+            if h0 < H { out[pair.0 as usize][x] |= 1u16 << h0; }
+            if x >= 1 && h1 < H { out[pair.1 as usize][x - 1] |= 1u16 << h1; }
+        }
+    }
+    out
+}
+
+// 深さ優先探索（depth_left 手以内のどこかで ちょうど target 連鎖を達成）
+fn dfs_exact_equal(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    idx: usize,
+    depth_left: usize,
+    target: u32,
+    abort: &Arc<AtomicBool>,
+) -> Option<(usize, Orient)> {
+    if abort.load(Ordering::Relaxed) { return None; }
+    let pair_len = pair_seq.len().max(1);
+    let pair = pair_seq[idx % pair_len];
+
+    // 候補手を列挙
+    let moves = cp_generate_moves_from_cols(&cols);
+    // まず 1 手見たときの評価を計算
+    let mut evals: Vec<((usize, Orient), u32, [[u16; W]; 4])> = Vec::with_capacity(moves.len());
+    for &(x, orient) in &moves {
+        if abort.load(Ordering::Relaxed) { return None; }
+        let after = cp_apply_move_pure(&cols, x, orient, pair);
+        let (gain, leftover) = simulate_chain_and_final(after);
+        evals.push(((x, orient), gain, leftover));
+    }
+    if depth_left == 1 {
+        if let Some(((x, orient), _g, _)) = evals.iter().find(|(_, g, _)| *g == target) {
+            return Some((*x, *orient));
+        }
+        return None;
+    }
+    // 深掘り（ヒューリスティクス: 大きい g を先に）
+    evals.sort_by(|a, b| b.1.cmp(&a.1));
+    for ((x, orient), g, leftover) in evals {
+        if abort.load(Ordering::Relaxed) { return None; }
+        if g == target { return Some((x, orient)); }
+        if let Some((_fx, _fo)) = dfs_exact_equal(leftover, pair_seq, idx + 1, depth_left - 1, target, abort) {
+            // ルート手として現在の (x, orient) を返す
+            return Some((x, orient));
+        }
+    }
+    None
+}
+
+// ちょうど target 連鎖が depth_left 手以内のどこかで到達可能か（根手は既に打たれている想定）
+fn dfs_exact_reachable(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    idx: usize,
+    depth_left: usize,
+    target: u32,
+    abort: &Arc<AtomicBool>,
+) -> bool {
+    if abort.load(Ordering::Relaxed) { return false; }
+    let pair_len = pair_seq.len().max(1);
+    let pair = pair_seq[idx % pair_len];
+
+    let moves = cp_generate_moves_from_cols(&cols);
+    // まず 1 手見たときの評価を計算
+    let mut evals: Vec<((usize, Orient), u32, [[u16; W]; 4])> = Vec::with_capacity(moves.len());
+    for &(x, orient) in &moves {
+        if abort.load(Ordering::Relaxed) { return false; }
+        let after = cp_apply_move_pure(&cols, x, orient, pair);
+        let (gain, leftover) = simulate_chain_and_final(after);
+        if gain == target { return true; }
+        evals.push(((x, orient), gain, leftover));
+    }
+    if depth_left <= 1 { return false; }
+    // 深掘り（ヒューリスティクス: 大きい g を先に）
+    evals.sort_by(|a, b| b.1.cmp(&a.1));
+    for ((_x, _orient), _g, leftover) in evals {
+        if abort.load(Ordering::Relaxed) { return false; }
+        if dfs_exact_reachable(leftover, pair_seq, idx + 1, depth_left - 1, target, abort) {
+            return true;
+        }
+    }
+    false
+}
+
+
 // ===== App ユーティリティ =====
 impl App {
+    // 新規作成（設定の自動読込を行う）
+    fn new() -> Self {
+        let mut app = App::default();
+        let _ = app.cp_load_settings();
+        app
+    }
+
+    // 設定ファイルパス（実行ディレクトリ直下）
+    fn cp_settings_path() -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("cp_settings.json")
+    }
+
+    // モジュール並びと設定値の保存
+    fn cp_save_settings(&mut self) -> Result<()> {
+        let settings = CpSettings { constraints: self.cp.constraints.clone(), tie_break: self.cp.tie_break.clone() };
+        let path = Self::cp_settings_path();
+        let f = File::create(&path).with_context(|| format!("設定ファイルを作成できません: {}", path.display()))?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer_pretty(&mut w, &settings).with_context(|| "設定のシリアライズに失敗")?;
+        w.flush().ok();
+        self.push_log(format!("設定を保存しました: {}", path.display()));
+        Ok(())
+    }
+
+    // モジュール並びと設定値の読込
+    fn cp_load_settings(&mut self) -> Result<()> {
+        let path = Self::cp_settings_path();
+        if !path.exists() { return Ok(()); }
+        let f = File::open(&path).with_context(|| format!("設定ファイルを開けません: {}", path.display()))?;
+        let r = BufReader::new(f);
+        let loaded: CpSettings = serde_json::from_reader(r).with_context(|| "設定のデシリアライズに失敗")?;
+        self.cp.constraints = loaded.constraints;
+        self.cp.tie_break = loaded.tie_break;
+        self.push_log(format!("設定を読み込みました: {}", path.display()));
+        Ok(())
+    }
     fn push_log(&mut self, s: String) {
         self.log_lines.push(s);
         if self.log_lines.len() > 500 {
@@ -942,14 +2588,16 @@ impl App {
         // 停滞比
         let stop_progress_plateau = self.stop_progress_plateau.clamp(0.0, 1.0);
         let exact_four_only = self.exact_four_only;
+        let require_free_top_e1 = self.require_free_top_e1;
         let profile_enabled = self.profile_enabled;
 
         self.push_log(format!(
-            "出力: JSONL / 形キャッシュ上限 ≈ {} 形 / 保存先: {} / 進捗停滞比={:.2} / 4個消しモード={} / 計測={}",
+            "出力: JSONL / 形キャッシュ上限 ≈ {} 形 / 保存先: {} / 進捗停滞比={:.2} / 4個消しモード={} / free-top E1限定={} / 計測={}",
             lru_limit,
             outfile.display(),
             stop_progress_plateau,
             if exact_four_only { "ON" } else { "OFF" },
+            if require_free_top_e1 { "ON" } else { "OFF" },
             if profile_enabled { "ON" } else { "OFF" },
         ));
 
@@ -963,6 +2611,7 @@ impl App {
                 abort,
                 stop_progress_plateau,
                 exact_four_only,
+                require_free_top_e1,
                 profile_enabled,
             ) {
                 let _ = tx.send(Message::Error(format!("{e:?}")));
@@ -1835,6 +3484,1166 @@ fn apply_erase_and_fall_exact4(cols: &[[u16; W]; 4]) -> StepExact {
     }
 }
 
+// ===== 全消しプレビュー用ヘルパー =====
+#[inline(always)]
+fn cols_is_empty(cols: &[[u16; W]; 4]) -> bool {
+    for c in 0..4 {
+        for x in 0..W {
+            if cols[c][x] != 0 { return false; }
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn col_height(cols: &[[u16; W]; 4], x: usize) -> usize {
+    let occ = (cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & MASK14;
+    occ.count_ones() as usize
+}
+
+// ===== 連結サイズ計測と配置位置算出のヘルパー =====
+#[inline(always)]
+fn comp_size_for_color_at(cols: &[[u16; W]; 4], color: u8, x: usize, y: usize) -> u32 {
+    if x >= W || y >= H { return 0; }
+    let bb = pack_cols(cols);
+    let mask = bb[color as usize];
+    let seed: BB = 1u128 << (x * COL_BITS + y);
+    if (mask & seed) == 0 { return 0; }
+    let mut comp = seed;
+    loop {
+        let grow = neighbors(comp) & mask & !comp;
+        if grow == 0 { break; }
+        comp |= grow;
+    }
+    comp.count_ones() as u32
+}
+
+// pair=(axis,child) の配置先座標（置く直前の cols に対して）
+#[inline(always)]
+fn cp_positions_for_move(cols: &[[u16; W]; 4], x: usize, orient: Orient) -> Option<((usize, usize), (usize, usize))> {
+    match orient {
+        Orient::Up => {
+            let h = col_height(cols, x);
+            if h + 1 >= H { return None; }
+            Some(((x, h), (x, h + 1)))
+        }
+        Orient::Down => {
+            let h = col_height(cols, x);
+            if h + 1 >= H { return None; }
+            Some(((x, h + 1), (x, h)))
+        }
+        Orient::Right => {
+            if x + 1 >= W { return None; }
+            let h0 = col_height(cols, x);
+            let h1 = col_height(cols, x + 1);
+            if h0 >= H || h1 >= H { return None; }
+            Some(((x, h0), (x + 1, h1)))
+        }
+        Orient::Left => {
+            if x == 0 { return None; }
+            let h0 = col_height(cols, x);
+            let h1 = col_height(cols, x - 1);
+            if h0 >= H || h1 >= H { return None; }
+            Some(((x, h0), (x - 1, h1)))
+        }
+    }
+}
+
+#[inline(always)]
+fn simulate_chain_count_simple(mut cols: [[u16; W]; 4]) -> u32 {
+    let mut cc: u32 = 0;
+    loop {
+        let (cleared, next) = apply_erase_and_fall_cols(&cols);
+        if !cleared { break; }
+        cols = next;
+        cc += 1;
+    }
+    cc
+}
+
+// ── タイブレーク：設置先高さの評価 ─────────────────────────────────────
+#[inline(always)]
+fn placement_height_metric(board: &[[u16; W]; 4], x: usize, orient: Orient) -> usize {
+    match orient {
+        Orient::Up | Orient::Down => col_height(board, x),
+        Orient::Right => {
+            let h0 = col_height(board, x);
+            let h1 = if x + 1 < W { col_height(board, x + 1) } else { H };
+            h0.min(h1)
+        }
+        Orient::Left => {
+            let h0 = col_height(board, x);
+            let h1 = if x >= 1 { col_height(board, x - 1) } else { H };
+            h0.min(h1)
+        }
+    }
+}
+
+#[inline(always)]
+fn orient_is_vertical(o: Orient) -> bool { matches!(o, Orient::Up | Orient::Down) }
+
+#[inline(always)]
+fn tie_break_choose(candidate: (usize, Orient), current: (usize, Orient), board: &[[u16; W]; 4], policy: &TieBreakPolicy) -> bool {
+    let (cx, co) = current;
+    let (nx, no) = candidate;
+    for &rule in &policy.rules {
+        match rule {
+            TieBreakRule::MinPlacementHeight => {
+                let ch = placement_height_metric(board, cx, co);
+                let nh = placement_height_metric(board, nx, no);
+                if nh < ch { return true; }
+                if nh > ch { return false; }
+            }
+            TieBreakRule::LeftmostColumn => {
+                if nx < cx { return true; }
+                if nx > cx { return false; }
+            }
+            TieBreakRule::PreferVertical => {
+                let cv = orient_is_vertical(co);
+                let nv = orient_is_vertical(no);
+                if nv && !cv { return true; }
+                if !nv && cv { return false; }
+            }
+            // ペア情報なしの評価関数では無効化（no-op）。
+            // ペア情報ありの tie_break_choose_with_pair を使用してください。
+            TieBreakRule::PreferDiagonalSameColor => {}
+            // 新規ルール（ペア情報なしでは評価できないため no-op）
+            TieBreakRule::PreferMake3GroupAvoidDiagDown23 => {}
+            TieBreakRule::PreferMake2GroupAvoidDiagDown23 => {}
+        }
+    }
+    false
+}
+
+// ── タイブレーク（ペア情報あり）：同色の斜め隣接優先を評価可能にする ─────────────
+#[inline(always)]
+fn tie_break_choose_with_pair(
+    candidate: (usize, Orient),
+    current: (usize, Orient),
+    board: &[[u16; W]; 4],
+    pair: (u8, u8),
+    policy: &TieBreakPolicy,
+) -> bool {
+    let (cx, co) = current;
+    let (nx, no) = candidate;
+    for &rule in &policy.rules {
+        match rule {
+            TieBreakRule::MinPlacementHeight => {
+                let ch = placement_height_metric(board, cx, co);
+                let nh = placement_height_metric(board, nx, no);
+                if nh < ch { return true; }
+                if nh > ch { return false; }
+            }
+            TieBreakRule::LeftmostColumn => {
+                if nx < cx { return true; }
+                if nx > cx { return false; }
+            }
+            TieBreakRule::PreferVertical => {
+                let cv = orient_is_vertical(co);
+                let nv = orient_is_vertical(no);
+                if nv && !cv { return true; }
+                if !nv && cv { return false; }
+            }
+            TieBreakRule::PreferDiagonalSameColor => {
+                let cv = diagonal_same_color_for_move(board, cx, co, pair);
+                let nv = diagonal_same_color_for_move(board, nx, no, pair);
+                if nv && !cv { return true; }
+                if !nv && cv { return false; }
+            }
+            TieBreakRule::PreferMake3GroupAvoidDiagDown23 => {
+                let mut cand3 = false;
+                if let Some((cpos_a, cpos_b)) = cp_positions_for_move(board, nx, no) {
+                    // 斜め下 2/3 連結回避（既存ぷよへの接続を避ける）
+                    if !avoid_connect_if_neighbor_has_diag_down_23(board, pair.0, cpos_a)
+                        && !avoid_connect_if_neighbor_has_diag_down_23(board, pair.1, cpos_b)
+                    {
+                        let after = cp_apply_move_pure(board, nx, no, pair);
+                        let sa = comp_size_for_color_at(&after, pair.0, cpos_a.0, cpos_a.1);
+                        let sb = comp_size_for_color_at(&after, pair.1, cpos_b.0, cpos_b.1);
+                        cand3 = sa == 3 || sb == 3;
+                    }
+                }
+                let mut curr3 = false;
+                if let Some((ppos_a, ppos_b)) = cp_positions_for_move(board, cx, co) {
+                    if !avoid_connect_if_neighbor_has_diag_down_23(board, pair.0, ppos_a)
+                        && !avoid_connect_if_neighbor_has_diag_down_23(board, pair.1, ppos_b)
+                    {
+                        let after = cp_apply_move_pure(board, cx, co, pair);
+                        let sa = comp_size_for_color_at(&after, pair.0, ppos_a.0, ppos_a.1);
+                        let sb = comp_size_for_color_at(&after, pair.1, ppos_b.0, ppos_b.1);
+                        curr3 = sa == 3 || sb == 3;
+                    }
+                }
+                if cand3 && !curr3 { return true; }
+                if !cand3 && curr3 { return false; }
+            }
+            TieBreakRule::PreferMake2GroupAvoidDiagDown23 => {
+                let mut cand2 = false;
+                if let Some((cpos_a, cpos_b)) = cp_positions_for_move(board, nx, no) {
+                    if !avoid_connect_if_neighbor_has_diag_down_23(board, pair.0, cpos_a)
+                        && !avoid_connect_if_neighbor_has_diag_down_23(board, pair.1, cpos_b)
+                    {
+                        let after = cp_apply_move_pure(board, nx, no, pair);
+                        let sa = comp_size_for_color_at(&after, pair.0, cpos_a.0, cpos_a.1);
+                        let sb = comp_size_for_color_at(&after, pair.1, cpos_b.0, cpos_b.1);
+                        cand2 = sa == 2 || sb == 2;
+                    }
+                }
+                let mut curr2 = false;
+                if let Some((ppos_a, ppos_b)) = cp_positions_for_move(board, cx, co) {
+                    if !avoid_connect_if_neighbor_has_diag_down_23(board, pair.0, ppos_a)
+                        && !avoid_connect_if_neighbor_has_diag_down_23(board, pair.1, ppos_b)
+                    {
+                        let after = cp_apply_move_pure(board, cx, co, pair);
+                        let sa = comp_size_for_color_at(&after, pair.0, ppos_a.0, ppos_a.1);
+                        let sb = comp_size_for_color_at(&after, pair.1, ppos_b.0, ppos_b.1);
+                        curr2 = sa == 2 || sb == 2;
+                    }
+                }
+                if cand2 && !curr2 { return true; }
+                if !cand2 && curr2 { return false; }
+            }
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn tie_break_cmp_with_pair(
+    a: (usize, Orient),
+    b: (usize, Orient),
+    board: &[[u16; W]; 4],
+    pair: (u8, u8),
+    policy: &TieBreakPolicy,
+) -> std::cmp::Ordering {
+    if !policy.apply_initial { return std::cmp::Ordering::Equal; }
+    let ab = tie_break_choose_with_pair(a, b, board, pair, policy);
+    let ba = tie_break_choose_with_pair(b, a, board, pair, policy);
+    if ab && !ba { std::cmp::Ordering::Less }
+    else if ba && !ab { std::cmp::Ordering::Greater }
+    else { std::cmp::Ordering::Equal }
+}
+
+// 共通ヘルパー（ペアあり）: 候補集合からタイブレーク規則に従って最良手を1つ選ぶ
+#[inline(always)]
+fn select_best_move_with_pair(
+    cands: &[(usize, Orient)],
+    board: &[[u16; W]; 4],
+    pair: (u8, u8),
+    policy: &TieBreakPolicy,
+) -> Option<(usize, Orient)> {
+    if cands.is_empty() { return None; }
+    let mut best = cands[0];
+    for &mv in &cands[1..] {
+        if tie_break_cmp_with_pair(mv, best, board, pair, policy) == std::cmp::Ordering::Less {
+            best = mv;
+        }
+    }
+    Some(best)
+}
+
+// 共通ヘルパー（ペアあり）: スコア最大を優先し、同点ならタイブレーク
+#[inline(always)]
+fn select_best_scored_i32_with_pair(
+    cands: &[((usize, Orient), i32)],
+    board: &[[u16; W]; 4],
+    pair: (u8, u8),
+    policy: &TieBreakPolicy,
+) -> Option<(usize, Orient)> {
+    if cands.is_empty() { return None; }
+    let mut best = cands[0];
+    for &item in &cands[1..] {
+        if item.1 > best.1 {
+            best = item;
+        } else if item.1 == best.1 {
+            if tie_break_cmp_with_pair(item.0, best.0, board, pair, policy) == std::cmp::Ordering::Less {
+                best = item;
+            }
+        }
+    }
+    Some(best.0)
+}
+
+// 先読み手数（ペア）で盤面を拡張し、その後ビーム（単ぷよ追加）で評価
+#[inline(always)]
+fn cp_evaluate_with_pair_lookahead(
+    after_first: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    mut next_pair_idx: usize,
+    lookahead_pairs: usize,
+    beam_depth: usize,
+    beam_width: usize,
+    abort: &Arc<AtomicBool>,
+    first_pair_positions: Option<((usize, usize), (usize, usize))>,
+) -> (u32, Option<[[u16; W]; 4]>, Option<u32>) {
+    if abort.load(Ordering::Relaxed) {
+        return (simulate_chain_count_simple(after_first), None, None);
+    }
+
+    // ペア先読み：ビーム幅は beam_width を流用
+    #[derive(Clone)]
+    struct PairNode { board: [[u16; W]; 4], idx: usize }
+    let mut frontier: Vec<PairNode> = vec![PairNode { board: after_first, idx: next_pair_idx }];
+
+    let pair_len = pair_seq.len().max(1);
+    for _d in 0..lookahead_pairs {
+        if abort.load(Ordering::Relaxed) { break; }
+        let mut candidates: Vec<(i32, PairNode)> = Vec::new();
+        for node in &frontier {
+            if abort.load(Ordering::Relaxed) { break; }
+            let pair = pair_seq[node.idx % pair_len];
+            let moves = cp_generate_moves_from_cols(&node.board);
+            for (x, orient) in moves {
+                if abort.load(Ordering::Relaxed) { break; }
+                let b2 = cp_apply_move_pure(&node.board, x, orient, pair);
+                let h = simulate_chain_count_simple(b2) as i32; // 簡易ヒューリスティック
+                candidates.push((h, PairNode { board: b2, idx: node.idx + 1 }));
+            }
+        }
+        if candidates.is_empty() { break; }
+        // 上位 beam_width のみ残す
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let keep = candidates.into_iter().take(beam_width.max(1)).map(|(_, n)| n).collect::<Vec<_>>();
+        frontier = keep;
+    }
+
+    // 葉でビーム（単ぷよ追加）評価
+    let mut best_score: i32 = -1;
+    let mut best_prev: Option<[[u16; W]; 4]> = None;
+    let mut best_chain: Option<u32> = None;
+    for node in &frontier {
+        if abort.load(Ordering::Relaxed) { break; }
+        if let Some((adds, total_chain)) = cp_iterative_chain_clearing_beam(node.board, beam_depth, beam_width, first_pair_positions) {
+            let merged = merge_additions_onto(node.board, &adds);
+            if (total_chain as i32) > best_score {
+                best_score = total_chain as i32;
+                best_prev = Some(merged);
+                best_chain = Some(total_chain);
+            } else if (total_chain as i32) == best_score {
+                // tie-break: 盤面の占有が少ない方
+                let cur_occ = board_occupied_count(best_prev.as_ref().unwrap_or(&node.board));
+                let new_occ = board_occupied_count(&merged);
+                if new_occ < cur_occ {
+                    best_prev = Some(merged);
+                    best_chain = Some(total_chain);
+                }
+            }
+        } else {
+            let sc = simulate_chain_count_simple(node.board) as i32;
+            if sc > best_score { best_score = sc; best_prev = None; best_chain = None; }
+        }
+    }
+
+    if best_score < 0 {
+        (simulate_chain_count_simple(after_first), None, None)
+    } else {
+        (best_score as u32, best_prev, best_chain)
+    }
+}
+
+#[inline(always)]
+fn simulate_chain_and_final(mut cols: [[u16; W]; 4]) -> (u32, [[u16; W]; 4]) {
+    let mut cc: u32 = 0;
+    loop {
+        let (cleared, next) = apply_erase_and_fall_cols(&cols);
+        if !cleared { break; }
+        cols = next;
+        cc += 1;
+    }
+    (cc, cols)
+}
+
+// 1連鎖目で消えるグループ数（全色合計）
+#[inline(always)]
+fn count_first_clear_groups(cols: &[[u16; W]; 4]) -> u32 {
+    let bb = pack_cols(cols);
+    let mut groups: u32 = 0;
+    for &mask in bb.iter() {
+        if mask.count_ones() < 4 { continue; }
+        let mut s = mask;
+        while s != 0 {
+            let seed = s & (!s + 1);
+            let mut comp = seed;
+            let mut frontier = seed;
+            loop {
+                let grow = neighbors(frontier) & mask & !comp;
+                if grow == 0 { break; }
+                comp |= grow;
+                frontier = grow;
+            }
+            if comp.count_ones() >= 4 { groups += 1; }
+            s &= !comp;
+        }
+    }
+    groups
+}
+
+// 座標 (x,y) の近傍（上下左右）に存在する色を列挙
+fn neighbor_colors_at(cols: &[[u16; W]; 4], x: usize, y: usize) -> [bool; 4] {
+    let mut used = [false; 4];
+    let mut check = |nx: isize, ny: isize| {
+        if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { return; }
+        let nxu = nx as usize; let nyu = ny as usize;
+        let bit = 1u16 << nyu;
+        for c in 0..4 {
+            if (cols[c][nxu] & bit) != 0 { used[c] = true; }
+        }
+    };
+    check(x as isize - 1, y as isize);
+    check(x as isize + 1, y as isize);
+    check(x as isize, y as isize - 1);
+    check(x as isize, y as isize + 1);
+    used
+}
+
+// 斜め方向（4近傍の対角）に同色が存在するか
+#[inline(always)]
+fn has_diagonal_same_color(cols: &[[u16; W]; 4], color: u8, x: usize, y: usize) -> bool {
+    let cidx = color as usize;
+    let mut check = |nx: isize, ny: isize| -> bool {
+        if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { return false; }
+        let nxu = nx as usize; let nyu = ny as usize;
+        let bit = 1u16 << nyu;
+        (cols[cidx][nxu] & bit) != 0
+    };
+    check(x as isize - 1, y as isize - 1)
+        || check(x as isize + 1, y as isize - 1)
+        || check(x as isize - 1, y as isize + 1)
+        || check(x as isize + 1, y as isize + 1)
+}
+
+// 与えられた手 (x,orient) を現在盤面に適用したとき、ペアのどちらかが同色の斜め隣接を持つか（判定は現盤面基準）
+#[inline(always)]
+fn diagonal_same_color_for_move(board: &[[u16; W]; 4], x: usize, orient: Orient, pair: (u8, u8)) -> bool {
+    if let Some(((ax, ay), (bx, by))) = cp_positions_for_move(board, x, orient) {
+        has_diagonal_same_color(board, pair.0, ax, ay) || has_diagonal_same_color(board, pair.1, bx, by)
+    } else { false }
+}
+
+// 与えた座標に同色が存在するか
+#[inline(always)]
+fn has_same_color_at(cols: &[[u16; W]; 4], color: u8, x: usize, y: usize) -> bool {
+    if x >= W || y >= H { return false; }
+    let bit = 1u16 << y;
+    (cols[color as usize][x] & bit) != 0
+}
+
+// 置こうとしている位置 (px,py) と同色の既存ぷよ（上下左右のどれか）に連結する場合、
+// その既存ぷよの「斜め下（左下 or 右下）」に同色の2連結または3連結が存在するなら true
+#[inline(always)]
+fn avoid_connect_if_neighbor_has_diag_down_23(cols: &[[u16; W]; 4], color: u8, pos: (usize, usize)) -> bool {
+    let (px, py) = pos;
+    // 既存同色との連結先を列挙（現盤面）
+    let mut neighs: [(isize, isize); 4] = [
+        (px as isize - 1, py as isize),
+        (px as isize + 1, py as isize),
+        (px as isize, py as isize - 1),
+        (px as isize, py as isize + 1),
+    ];
+    for &(nx, ny) in &neighs {
+        if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { continue; }
+        let nxu = nx as usize; let nyu = ny as usize;
+        if !has_same_color_at(cols, color, nxu, nyu) { continue; }
+        // 既存ぷよ (nxu,nyu) の斜め下2方向
+        let diag = [ (nx - 1, ny - 1), (nx + 1, ny - 1) ];
+        for &(dx, dy) in &diag {
+            if dx < 0 || dx >= W as isize || dy < 0 || dy >= H as isize { continue; }
+            let dxu = dx as usize; let dyu = dy as usize;
+            if !has_same_color_at(cols, color, dxu, dyu) { continue; }
+            let sz = comp_size_for_color_at(cols, color, dxu, dyu);
+            if sz == 2 || sz == 3 { return true; }
+        }
+    }
+    false
+}
+
+// 指定した色レイヤ s の seeds（座標群）から連結成分をユニオン
+fn union_components_from_seeds(s: &[u16; W], seeds: &[(usize, usize)]) -> [u16; W] {
+    let mut acc = [0u16; W];
+    for &(sx, sy) in seeds {
+        let bit = 1u16 << sy;
+        if (s[sx] & bit) == 0 { continue; }
+        let comp = component_from_seed_cols(s, sx, bit);
+        for x in 0..W { acc[x] |= comp[x]; }
+    }
+    acc
+}
+
+#[inline(always)]
+fn is_adjacent_to_group(group: &[u16; W], x: usize, y: usize) -> bool {
+    let bit = 1u16 << y;
+    if x > 0 && (group[x - 1] & bit) != 0 { return true; }
+    if x + 1 < W && (group[x + 1] & bit) != 0 { return true; }
+    if y > 0 && (group[x] & (bit >> 1)) != 0 { return true; }
+    if y + 1 < H && (group[x] & (bit << 1)) != 0 { return true; }
+    false
+}
+
+fn allowed_cols_from_group(group: &[u16; W]) -> [bool; W] {
+    let mut allow = [false; W];
+    for x in 0..W {
+        if group[x] != 0 {
+            allow[x] = true;
+            if x > 0 { allow[x - 1] = true; }
+            if x + 1 < W { allow[x + 1] = true; }
+        }
+    }
+    allow
+}
+
+// 追加分を元盤面へ順番に積む（列ごとに高さを進める）
+fn merge_additions_onto(original: [[u16; W]; 4], adds: &Vec<(usize, u8)>) -> [[u16; W]; 4] {
+    let mut out = original;
+    let mut heights = [0usize; W];
+    for x in 0..W { heights[x] = col_height(&out, x); }
+    for &(x, c) in adds {
+        if x >= W { continue; }
+        if heights[x] >= H { continue; }
+        out[c as usize][x] |= 1u16 << heights[x];
+        heights[x] += 1;
+    }
+    out
+}
+
+// 1手ぶんの最良拡張（leftover を基準）。
+// 返り値: (この手での連鎖数, 追加後の盤面, この手で新規追加した (col,color) 群)
+fn find_best_single_step_extension(
+    leftover: &[[u16; W]; 4],
+    original: &[[u16; W]; 4],
+    prev_additions: &Vec<(usize, u8)>,
+    blocked_cols_opt: Option<&[bool; W]>,
+) -> Option<(u32, [[u16; W]; 4], Vec<(usize, u8)>)> {
+    let blocked = blocked_cols_opt.unwrap_or(&[false; W]);
+
+    let mut best_chain: i32 = -1;
+    let mut best_after: Option<[[u16; W]; 4]> = None;
+    let mut best_adds: Vec<(usize, u8)> = Vec::new();
+
+    for x in 0..W {
+        let y = col_height(leftover, x);
+        if y >= H { continue; }
+
+        let used = neighbor_colors_at(leftover, x, y);
+        for color in 0u8..4u8 {
+            if !used[color as usize] { continue; }
+
+            // 近傍同色を seeds に集め、成分ユニオン（puyoA）
+            let mut seeds: Vec<(usize, usize)> = Vec::new();
+            let mut push_if = |nx: isize, ny: isize| {
+                if nx < 0 || nx >= W as isize || ny < 0 || ny >= H as isize { return; }
+                let nxu = nx as usize; let nyu = ny as usize;
+                let bit = 1u16 << nyu;
+                if (leftover[color as usize][nxu] & bit) != 0 { seeds.push((nxu, nyu)); }
+            };
+            push_if(x as isize - 1, y as isize);
+            push_if(x as isize + 1, y as isize);
+            push_if(x as isize, y as isize - 1);
+            push_if(x as isize, y as isize + 1);
+
+            let puyo_a = union_components_from_seeds(&leftover[color as usize], &seeds);
+            let mut groups: Vec<[u16; W]> = Vec::new();
+            // 重複除去しつつ近傍の各成分を収集
+            for &(sx, sy) in &seeds {
+                let comp = component_from_seed_cols(&leftover[color as usize], sx, 1u16 << sy);
+                if comp.iter().all(|&m| m == 0) { continue; }
+                let mut dup = false;
+                for g in &groups {
+                    let mut inter = false;
+                    for ix in 0..W { if (g[ix] & comp[ix]) != 0 { inter = true; break; } }
+                    if inter { dup = true; break; }
+                }
+                if !dup { groups.push(comp); }
+            }
+            let mut total_adj: u32 = 0;
+            for g in &groups { total_adj += g.iter().map(|&m| m.count_ones()).sum::<u32>(); }
+            let effective_adj = total_adj.min(3);
+            let needed = 4u32.saturating_sub(effective_adj) as usize; // 0..=3
+
+            let mut allow = allowed_cols_from_group(&puyo_a);
+            let mut temp = *leftover;
+            let mut additions_step: Vec<(usize, u8)> = Vec::new();
+            let mut adjacency = puyo_a.clone();
+
+            let mut placed: usize = 0;
+            for _ in 0..needed {
+                let mut cand_best_chain: i32 = -1;
+                let mut cand_best_cols: Option<[[u16; W]; 4]> = None;
+                let mut cand_best_col: Option<usize> = None;
+
+                for col in 0..W {
+                    if !allow[col] || blocked[col] { continue; }
+                    let h = col_height(&temp, col);
+                    if h >= H { continue; }
+                    if !is_adjacent_to_group(&adjacency, col, h) { continue; }
+
+                    let mut t2 = temp;
+                    t2[color as usize][col] |= 1u16 << h;
+
+                    // マージ後の初手同時消し（>1 グループ）にならないかをチェック
+                    let mut merged_adds = prev_additions.clone();
+                    merged_adds.extend_from_slice(&additions_step);
+                    merged_adds.push((col, color));
+                    let merged_board = merge_additions_onto(*original, &merged_adds);
+                    let fg = count_first_clear_groups(&merged_board);
+
+                    let cc_tmp = simulate_chain_count_simple(t2);
+                    if cc_tmp >= 1 && fg > 1 { continue; }
+
+                    if (cc_tmp as i32) > cand_best_chain {
+                        cand_best_chain = cc_tmp as i32;
+                        cand_best_cols = Some(t2);
+                        cand_best_col = Some(col);
+                    }
+                }
+
+                let Some(col) = cand_best_col else { break; };
+                let t2 = cand_best_cols.unwrap();
+                temp = t2;
+                let h = col_height(&temp, col).saturating_sub(1);
+                if col < W { additions_step.push((col, color)); }
+
+                // 隣接集合/許容列の更新
+                if col > 0 { allow[col - 1] = true; }
+                allow[col] = true;
+                if col + 1 < W { allow[col + 1] = true; }
+                adjacency[col] |= 1u16 << h;
+                placed += 1;
+            }
+
+            if placed == needed {
+                let cc = simulate_chain_count_simple(temp);
+                if (cc as i32) > best_chain {
+                    best_chain = cc as i32;
+                    best_after = Some(temp);
+                    best_adds = additions_step;
+                }
+            }
+        }
+    }
+
+    if best_chain < 0 { None } else { Some((best_chain as u32, best_after.unwrap(), best_adds)) }
+}
+
+// ====== ビームサーチ型：iterative_chain_clearing（python版相当の移植） ======
+#[derive(Clone)]
+struct BeamNode {
+    leftover: [[u16; W]; 4],
+    additions: Vec<(usize, u8)>,
+    total_chain: u32,
+    first_chain_locked: bool,
+}
+
+#[inline(always)]
+fn board_occupied_count(cols: &[[u16; W]; 4]) -> u32 {
+    let mut s: u32 = 0;
+    for c in 0..4 {
+        for x in 0..W { s = s.saturating_add(cols[c][x].count_ones()); }
+    }
+    s
+}
+
+// 初手の最大塊サイズ（グループ数>0のときの最大 comp サイズ）
+fn first_clear_largest_size(cols: &[[u16; W]; 4]) -> u32 {
+    let bb = pack_cols(cols);
+    let mut best: u32 = 0;
+    for &mask in bb.iter() {
+        if mask.count_ones() < 4 { continue; }
+        let mut s = mask;
+        while s != 0 {
+            let seed = s & (!s + 1);
+            let mut comp = seed;
+            let mut frontier = seed;
+            loop {
+                let grow = neighbors(frontier) & mask & !comp;
+                if grow == 0 { break; }
+                comp |= grow;
+                frontier = grow;
+            }
+            let sz = comp.count_ones();
+            if sz >= 4 { best = best.max(sz as u32); }
+            s &= !comp;
+        }
+    }
+    best
+}
+
+// 1連鎖目で消える塊のうち、少なくとも1列は「その列の上に何も乗っていない（列の最上段が塊に含まれる）」を満たすか
+fn first_clear_has_free_top(cols: &[[u16; W]; 4]) -> bool {
+    let clear = compute_erase_mask_cols(cols);
+    // 1つも消えないなら満たせない
+    if (0..W).all(|x| clear[x] == 0) { return false; }
+    for x in 0..W {
+        let m = clear[x] & MASK14;
+        if m == 0 { continue; }
+        // この列の塊の最上段 y を求める
+        let mut top_y_opt = None;
+        for y in (0..H).rev() {
+            if (m & (1u16 << y)) != 0 { top_y_opt = Some(y); break; }
+        }
+        if let Some(top_y) = top_y_opt {
+            let occ = (cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & MASK14;
+            let above_mask: u16 = (!((1u16 << (top_y + 1)) - 1)) & MASK14;
+            if (occ & above_mask) == 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn expand_beam_node(
+    original: &[[u16; W]; 4],
+    node: &BeamNode,
+    first_pair_positions: Option<((usize, usize), (usize, usize))>,
+) -> Vec<BeamNode> {
+    let mut out: Vec<BeamNode> = Vec::new();
+    // 1個追加の全候補（隣接色のみ）
+    for x in 0..W {
+        let y = col_height(&node.leftover, x);
+        if y >= H { continue; }
+        let used = neighbor_colors_at(&node.leftover, x, y);
+        // 隣接色がなければスキップ（ヒューリスティック）
+        if !used.iter().any(|&u| u) { continue; }
+        for color in 0u8..4u8 {
+            if !used[color as usize] { continue; }
+
+            let mut after = node.leftover;
+            after[color as usize][x] |= 1u16 << y;
+
+            let (gain, next_leftover) = simulate_chain_and_final(after);
+
+            // マージ側（初期盤面 + 全追加）での 1連鎖目を評価
+            let mut merged_adds = node.additions.clone();
+            merged_adds.push((x, color));
+            let merged_board = merge_additions_onto(*original, &merged_adds);
+            let groups = count_first_clear_groups(&merged_board);
+            if groups > 1 {
+                // フォールバック: 同じ色を隣接列に移して合流を避け、かつ仮配置側では連鎖が起きることを要求
+                let mut separated = false;
+                for dx in [-1isize, 1] {
+                    let ax = x as isize + dx;
+                    if ax < 0 || ax >= W as isize { continue; }
+                    let axu = ax as usize;
+                    let ay = col_height(&node.leftover, axu);
+                    if ay >= H { continue; }
+                    // 仮配置時点で同色隣接（連鎖の芽）
+                    let used2 = neighbor_colors_at(&node.leftover, axu, ay);
+                    if !used2[color as usize] { continue; }
+
+                    let mut after2 = node.leftover;
+                    after2[color as usize][axu] |= 1u16 << ay;
+                    let (gain2, next_leftover2) = simulate_chain_and_final(after2);
+
+                    // 代替のマージ側で 1グループかつ free-top、かつ仮配置で1連鎖以上
+                    let mut merged_adds2 = node.additions.clone();
+                    merged_adds2.push((axu, color));
+                    let merged_board2 = merge_additions_onto(*original, &merged_adds2);
+                    let groups2 = count_first_clear_groups(&merged_board2);
+                    if gain2 >= 1 && groups2 == 1 && first_clear_has_free_top(&merged_board2)
+                        && first_clear_largest_size(&merged_board2) <= 5 {
+                        // 追加制約: free-top 列かつ、新規追加セルが E1 消去に参加している場合は回避
+                        let ft2 = first_clear_free_top_cols(&merged_board2);
+                        if ft2[axu] {
+                            let occ_total = merged_adds2.iter().filter(|(cx, _)| *cx == axu).count();
+                            let y_new = col_height(original, axu) + occ_total.saturating_sub(1);
+                            let clear2 = compute_erase_mask_cols(&merged_board2);
+                            if (clear2[axu] & (1u16 << y_new)) != 0 { continue; }
+                        }
+                        // 追加制約: 初手ペアが free-top 列の消去成分に含まれている場合も回避
+                        if let Some(((px, py), (qx, qy))) = first_pair_positions {
+                            let clear2 = compute_erase_mask_cols(&merged_board2);
+                            let pa = (clear2[px] & (1u16 << py)) != 0;
+                            let qb = (clear2[qx] & (1u16 << qy)) != 0;
+                            if (ft2[px] && pa) || (ft2[qx] && qb) { continue; }
+                        }
+                        let mut additions = node.additions.clone();
+                        additions.push((axu, color));
+                        if precompleted_free_top_e1_on_last_step(original, &additions) { continue; }
+                        let first_locked = node.first_chain_locked || count_first_clear_groups(&merged_board2) > 0 || gain2 >= 1;
+                        out.push(BeamNode {
+                            leftover: next_leftover2,
+                            additions,
+                            total_chain: node.total_chain.saturating_add(gain2),
+                            first_chain_locked: first_locked,
+                        });
+                        separated = true;
+                    }
+                }
+                if !separated {
+                    // 回避不能ならこの候補は捨てる
+                    continue;
+                } else {
+                    // 代替を push 済み。元の配置はスキップ
+                    continue;
+                }
+            } else if groups == 1 {
+                // 条件: 少なくとも1列は塊の上に何も乗っていない かつ 連結数 <= 5（merged_board で判定）
+                if !(first_clear_has_free_top(&merged_board) && first_clear_largest_size(&merged_board) <= 5) {
+                    // 隣接列に置き方を変えて、この条件を満たせるか試す
+                    let mut accepted = false;
+                    for dx in [-1isize, 1] {
+                        let ax = x as isize + dx;
+                        if ax < 0 || ax >= W as isize { continue; }
+                        let axu = ax as usize;
+                        let ay = col_height(&node.leftover, axu);
+                        if ay >= H { continue; }
+                        let used2 = neighbor_colors_at(&node.leftover, axu, ay);
+                        if !used2[color as usize] { continue; }
+
+                        let mut after2 = node.leftover;
+                        after2[color as usize][axu] |= 1u16 << ay;
+                        let (gain2, next_leftover2) = simulate_chain_and_final(after2);
+
+                        let mut merged_adds2 = node.additions.clone();
+                        merged_adds2.push((axu, color));
+                        let merged_board2 = merge_additions_onto(*original, &merged_adds2);
+                        let groups2 = count_first_clear_groups(&merged_board2);
+                        if groups2 == 1 && first_clear_has_free_top(&merged_board2)
+                            && first_clear_largest_size(&merged_board2) <= 5 {
+                            // 追加制約: free-top 列かつ、新規追加セルが E1 消去に参加している場合は回避
+                            let ft2 = first_clear_free_top_cols(&merged_board2);
+                            if ft2[axu] {
+                                let occ_total = merged_adds2.iter().filter(|(cx, _)| *cx == axu).count();
+                                let y_new = col_height(original, axu) + occ_total.saturating_sub(1);
+                                let clear2 = compute_erase_mask_cols(&merged_board2);
+                                if (clear2[axu] & (1u16 << y_new)) != 0 { continue; }
+                            }
+                            // 追加制約: 初手ペアが free-top 列の消去成分に含まれている場合も回避
+                            if let Some(((px, py), (qx, qy))) = first_pair_positions {
+                                let clear2 = compute_erase_mask_cols(&merged_board2);
+                                let pa = (clear2[px] & (1u16 << py)) != 0;
+                                let qb = (clear2[qx] & (1u16 << qy)) != 0;
+                                if (ft2[px] && pa) || (ft2[qx] && qb) { continue; }
+                            }
+                            let mut additions = node.additions.clone();
+                            additions.push((axu, color));
+                            if precompleted_free_top_e1_on_last_step(original, &additions) { continue; }
+                            let first_locked = node.first_chain_locked || count_first_clear_groups(&merged_board2) > 0 || gain2 >= 1;
+                            out.push(BeamNode {
+                                leftover: next_leftover2,
+                                additions,
+                                total_chain: node.total_chain.saturating_add(gain2),
+                                first_chain_locked: first_locked,
+                            });
+                            accepted = true;
+                        }
+                    }
+                    if !accepted { continue; } else { continue; }
+                } else {
+                    // 条件自体は満たしているが、free-top 列に自分で置いたケースを回避
+                    let ft = first_clear_free_top_cols(&merged_board);
+                    if ft[x] {
+                        // 隣接列へ移せるなら移す
+                        let mut moved = false;
+                        for dx in [-1isize, 1] {
+                            let ax = x as isize + dx;
+                            if ax < 0 || ax >= W as isize { continue; }
+                            let axu = ax as usize;
+                            let ay = col_height(&node.leftover, axu);
+                            if ay >= H { continue; }
+                            let used2 = neighbor_colors_at(&node.leftover, axu, ay);
+                            if !used2[color as usize] { continue; }
+                            let mut after2 = node.leftover;
+                            after2[color as usize][axu] |= 1u16 << ay;
+                            let (gain2, next_leftover2) = simulate_chain_and_final(after2);
+                            let mut merged_adds2 = node.additions.clone();
+                            merged_adds2.push((axu, color));
+                            let merged_board2 = merge_additions_onto(*original, &merged_adds2);
+                            let groups2 = count_first_clear_groups(&merged_board2);
+                            if groups2 == 1 && first_clear_has_free_top(&merged_board2)
+                                && first_clear_largest_size(&merged_board2) <= 5 {
+                                let ft2 = first_clear_free_top_cols(&merged_board2);
+                                if ft2[axu] {
+                                    let occ_total = merged_adds2.iter().filter(|(cx, _)| *cx == axu).count();
+                                    let y_new = col_height(original, axu) + occ_total.saturating_sub(1);
+                                    let clear2 = compute_erase_mask_cols(&merged_board2);
+                                    if (clear2[axu] & (1u16 << y_new)) != 0 { continue; }
+                                }
+                                if let Some(((px, py), (qx, qy))) = first_pair_positions {
+                                    let clear2 = compute_erase_mask_cols(&merged_board2);
+                                    let pa = (clear2[px] & (1u16 << py)) != 0;
+                                    let qb = (clear2[qx] & (1u16 << qy)) != 0;
+                                    if (ft2[px] && pa) || (ft2[qx] && qb) { continue; }
+                                }
+                                let mut additions = node.additions.clone();
+                                additions.push((axu, color));
+                                if precompleted_free_top_e1_on_last_step(original, &additions) { continue; }
+                                let first_locked = node.first_chain_locked || count_first_clear_groups(&merged_board2) > 0 || gain2 >= 1;
+                                out.push(BeamNode {
+                                    leftover: next_leftover2,
+                                    additions,
+                                    total_chain: node.total_chain.saturating_add(gain2),
+                                    first_chain_locked: first_locked,
+                                });
+                                moved = true;
+                            }
+                        }
+                        if !moved { continue; } else { continue; }
+                    }
+                }
+            }
+
+            let mut additions = node.additions.clone();
+            additions.push((x, color));
+
+            // 初手が発生したか（merged側でグループが >=1 でも true とする）
+            let first_locked = if node.first_chain_locked {
+                true
+            } else {
+                count_first_clear_groups(&merged_board) > 0 || gain >= 1
+            };
+
+            // 通常受理：初手ペア／追加群が free-top 列の消去成分に含まれていないか最終確認
+            if let Some(((px, py), (qx, qy))) = first_pair_positions {
+                let clear = compute_erase_mask_cols(&merged_board);
+                if first_clear_has_free_top(&merged_board) {
+                    let ft = first_clear_free_top_cols(&merged_board);
+                    let pa = (clear[px] & (1u16 << py)) != 0;
+                    let qb = (clear[qx] & (1u16 << qy)) != 0;
+                    if (ft[px] && pa) || (ft[qx] && qb) {
+                        continue;
+                    }
+                }
+            }
+            if any_addition_on_free_top_involved_in_e1(original, &additions) { continue; }
+            out.push(BeamNode {
+                leftover: next_leftover,
+                additions,
+                total_chain: node.total_chain.saturating_add(gain),
+                first_chain_locked: first_locked,
+            });
+        }
+    }
+    out
+}
+
+fn cp_iterative_chain_clearing_beam(
+    original: [[u16; W]; 4],
+    max_depth: usize,
+    beam_width: usize,
+    first_pair_positions: Option<((usize, usize), (usize, usize))>,
+) -> Option<(Vec<(usize, u8)>, u32)> {
+    // 自然連鎖を先に適用
+    let (baseline, leftover0) = simulate_chain_and_final(original);
+
+    let mut beam: Vec<BeamNode> = vec![BeamNode {
+        leftover: leftover0,
+        additions: Vec::new(),
+        total_chain: baseline,
+        first_chain_locked: baseline > 0,
+    }];
+
+    let mut best = beam[0].clone();
+    let mut best_valid: Option<BeamNode> = None; // g==1 かつ free-top を満たした最良
+
+    for _d in 0..max_depth {
+        // 目標達成
+        if cols_is_empty(&best.leftover) { break; }
+
+        let mut cand_all: Vec<BeamNode> = Vec::new();
+        for node in &beam {
+            let ex = expand_beam_node(&original, node, first_pair_positions);
+            cand_all.extend(ex);
+        }
+        if cand_all.is_empty() { break; }
+
+        // 有効解（g==1 & free-top）を収集（トリミング前）
+        for n in &cand_all {
+            let merged = merge_additions_onto(original, &n.additions);
+            let g = count_first_clear_groups(&merged);
+            if g == 1 && first_clear_has_free_top(&merged) && first_clear_largest_size(&merged) <= 5 {
+                if precompleted_free_top_e1_on_last_step(&original, &n.additions) { continue; }
+                // 追加ゲート: 直近の単ぷよが free-top 列の E1 に参加している場合は拒否
+                if let Some(&(lx, _lc)) = n.additions.last() {
+                    let ft = first_clear_free_top_cols(&merged);
+                    if ft[lx] {
+                        let occ_total = n.additions.iter().filter(|(cx, _)| *cx == lx).count();
+                        let y_new = col_height(&original, lx) + occ_total.saturating_sub(1);
+                        let clear = compute_erase_mask_cols(&merged);
+                        if (clear[lx] & (1u16 << y_new)) != 0 { continue; }
+                    }
+                }
+                match &mut best_valid {
+                    None => best_valid = Some(n.clone()),
+                    Some(cur) => {
+                        if n.total_chain > cur.total_chain {
+                            *cur = n.clone();
+                        } else if n.total_chain == cur.total_chain {
+                            let co = board_occupied_count(&cur.leftover);
+                            let no = board_occupied_count(&n.leftover);
+                            if no < co { *cur = n.clone(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // スコアでソート
+        cand_all.sort_by(|a, b| {
+            // occupancy は小さい方が良い
+            let occ_a = board_occupied_count(&a.leftover);
+            let occ_b = board_occupied_count(&b.leftover);
+            // 初手最大塊サイズは初手未ロック時のみ評価
+            let a_first = if a.first_chain_locked { 0 } else { first_clear_largest_size(&merge_additions_onto(original, &a.additions)) };
+            let b_first = if b.first_chain_locked { 0 } else { first_clear_largest_size(&merge_additions_onto(original, &b.additions)) };
+
+            // 並べ替えキー（降順）: total_chain, a_first, -additions_len, -occ
+            (b.total_chain.cmp(&a.total_chain))
+                .then(b_first.cmp(&a_first))
+                .then(a.additions.len().cmp(&b.additions.len()))
+                .then(occ_a.cmp(&occ_b))
+        });
+
+        // 上位 beam_width
+        if cand_all.len() > beam_width { cand_all.truncate(beam_width); }
+        beam = cand_all;
+
+        // ベスト更新（全消し優先, 次いで total_chain）
+        for n in &beam {
+            if let Some(&(lx, _lc)) = n.additions.last() {
+                let merged = merge_additions_onto(original, &n.additions);
+                if precompleted_free_top_e1_on_last_step(&original, &n.additions) { continue; }
+                let ft = first_clear_free_top_cols(&merged);
+                if ft[lx] {
+                    let occ_total = n.additions.iter().filter(|(cx, _)| *cx == lx).count();
+                    let y_new = col_height(&original, lx) + occ_total.saturating_sub(1);
+                    let clear = compute_erase_mask_cols(&merged);
+                    if (clear[lx] & (1u16 << y_new)) != 0 { continue; }
+                }
+            }
+            if cols_is_empty(&n.leftover) {
+                best = n.clone();
+                break;
+            }
+            if n.total_chain > best.total_chain {
+                best = n.clone();
+            } else if n.total_chain == best.total_chain {
+                // tie: occupancy 少ない方
+                let bo = board_occupied_count(&best.leftover);
+                let no = board_occupied_count(&n.leftover);
+                if no < bo { best = n.clone(); }
+            }
+        }
+    }
+
+    // 最優先は探索中に見つかった「g==1 & free-top」を満たすノード
+    if let Some(v) = best_valid {
+        return Some((v.additions, v.total_chain));
+    }
+
+    // 次点: 終了時点の beam から条件を満たすもの（保険）
+    let mut final_best_opt: Option<BeamNode> = None;
+    for n in &beam {
+        let merged = merge_additions_onto(original, &n.additions);
+        let g = count_first_clear_groups(&merged);
+        if g == 1 && first_clear_has_free_top(&merged) && first_clear_largest_size(&merged) <= 5 {
+            if precompleted_free_top_e1_on_last_step(&original, &n.additions) { continue; }
+            // 追加ゲート: 直近の単ぷよが free-top 列の E1 に参加している場合は拒否
+            if let Some(&(lx, _lc)) = n.additions.last() {
+                let ft = first_clear_free_top_cols(&merged);
+                if ft[lx] {
+                    let occ_total = n.additions.iter().filter(|(cx, _)| *cx == lx).count();
+                    let y_new = col_height(&original, lx) + occ_total.saturating_sub(1);
+                    let clear = compute_erase_mask_cols(&merged);
+                    if (clear[lx] & (1u16 << y_new)) != 0 { continue; }
+                }
+            }
+            match &mut final_best_opt {
+                None => final_best_opt = Some(n.clone()),
+                Some(cur) => {
+                    if n.total_chain > cur.total_chain {
+                        *cur = n.clone();
+                    } else if n.total_chain == cur.total_chain {
+                        let fo = board_occupied_count(&cur.leftover);
+                        let no = board_occupied_count(&n.leftover);
+                        if no < fo { *cur = n.clone(); }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(v) = final_best_opt { return Some((v.additions, v.total_chain)); }
+
+    // 条件を満たす解が見つからなければ None（プレビュー更新しない）
+    None
+}
+
+// ====== ビームサーチ（緩和版）：プレビュー用のフォールバック ======
+// 厳格条件（free-top/g==1/各種ゲート）を適用せず、単に total_chain 最大を目指す。
+// 必ず何かしらの解（現在の best）を返す。
+fn cp_iterative_chain_clearing_beam_relaxed(
+    original: [[u16; W]; 4],
+    max_depth: usize,
+    beam_width: usize,
+) -> (Vec<(usize, u8)>, u32) {
+    let (baseline, leftover0) = simulate_chain_and_final(original);
+    let mut beam: Vec<BeamNode> = vec![BeamNode {
+        leftover: leftover0,
+        additions: Vec::new(),
+        total_chain: baseline,
+        first_chain_locked: baseline > 0,
+    }];
+
+    let mut best = beam[0].clone();
+    for _d in 0..max_depth {
+        if cols_is_empty(&best.leftover) { break; }
+
+        let mut cand_all: Vec<BeamNode> = Vec::new();
+        for node in &beam {
+            for x in 0..W {
+                let y = col_height(&node.leftover, x);
+                if y >= H { continue; }
+                let used = neighbor_colors_at(&node.leftover, x, y);
+                let any_used = used.iter().any(|&u| u);
+                for color in 0u8..4u8 {
+                    // 隣接色が存在する列は隣接色のみ、そうでなければ全色を許容（停滞回避）
+                    if any_used && !used[color as usize] { continue; }
+
+                    let mut after = node.leftover;
+                    after[color as usize][x] |= 1u16 << y;
+                    let (gain, next_leftover) = simulate_chain_and_final(after);
+
+                    let mut additions = node.additions.clone();
+                    additions.push((x, color));
+                    cand_all.push(BeamNode {
+                        leftover: next_leftover,
+                        additions,
+                        total_chain: node.total_chain.saturating_add(gain),
+                        first_chain_locked: node.first_chain_locked || gain >= 1,
+                    });
+                }
+            }
+        }
+
+        if cand_all.is_empty() { break; }
+        cand_all.sort_by(|a, b| {
+            let occ_a = board_occupied_count(&a.leftover);
+            let occ_b = board_occupied_count(&b.leftover);
+            (b.total_chain.cmp(&a.total_chain))
+                .then(occ_a.cmp(&occ_b))
+                .then(a.additions.len().cmp(&b.additions.len()))
+        });
+        if cand_all.len() > beam_width { cand_all.truncate(beam_width); }
+        beam = cand_all;
+
+        for n in &beam {
+            if cols_is_empty(&n.leftover) {
+                best = n.clone();
+                break;
+            }
+            if n.total_chain > best.total_chain {
+                best = n.clone();
+            } else if n.total_chain == best.total_chain {
+                let bo = board_occupied_count(&best.leftover);
+                let no = board_occupied_count(&n.leftover);
+                if no < bo { best = n.clone(); }
+            }
+        }
+    }
+
+    (best.additions, best.total_chain)
+}
+
 // 列 x への 4色一括代入（ループ展開）
 #[inline(always)]
 fn assign_col_unrolled(cols: &mut [[u16; W]; 4], x: usize, masks: &[u16; 4]) {
@@ -1858,7 +4667,11 @@ fn clear_col_unrolled(cols: &mut [[u16; W]; 4], x: usize) {
 
 // E1単一連結 + 追加条件 + T到達（最適化版）
 #[inline(always)]
-fn reaches_t_from_pre_single_e1(pre: &[[u16; W]; 4], t: u32, exact_four_only: bool) -> bool {
+fn reaches_t_from_pre_single_e1(pre: &[[u16; W]; 4], t: u32, exact_four_only: bool, require_free_top_e1: bool) -> bool {
+    // 追加フィルタ: 1連鎖目にfree-top列が1つ以上（必要な場合）
+    if require_free_top_e1 && !first_clear_has_free_top(pre) {
+        return false;
+    }
     if exact_four_only {
         let mut potential: u32 = 0;
         for col in pre.iter() {
@@ -2390,6 +5203,7 @@ fn dfs_combine_parallel(
     order: &[usize],
     threshold: u32,
     exact_four_only: bool,
+    require_free_top_e1: bool,
     _memo: &mut ApproxLru, // 現方針では実質未使用（陽性のみ挿入なら使用可）
     local_output_once: &mut U64Set,
     global_output_once: &Arc<DU64Set>,
@@ -2458,7 +5272,7 @@ fn dfs_combine_parallel(
         }
         *mmiss_batch += 1;
         let reached = prof!(profile_enabled, time_batch.dfs_times[depth].leaf_memo_miss_compute, {
-            reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only)
+            reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only, require_free_top_e1)
         });
         if !reached {
             // 統計フラッシュ（従来通り）
@@ -2635,6 +5449,7 @@ fn dfs_combine_parallel(
                     order,
                     threshold,
                     exact_four_only,
+                    require_free_top_e1,
                     _memo,
                     local_output_once,
                     global_output_once,
@@ -2685,6 +5500,7 @@ fn dfs_combine_parallel(
                         order,
                         threshold,
                         exact_four_only,
+                        require_free_top_e1,
                         _memo,
                         local_output_once,
                         global_output_once,
@@ -2728,6 +5544,7 @@ fn dfs_combine_parallel(
                         order,
                         threshold,
                         exact_four_only,
+                        require_free_top_e1,
                         _memo,
                         local_output_once,
                         global_output_once,
@@ -2774,6 +5591,7 @@ fn run_search(
     abort: Arc<AtomicBool>,
     stop_progress_plateau: f32,
     exact_four_only: bool,
+    require_free_top_e1: bool,
     profile_enabled: bool,
 ) -> Result<()> {
     let info = build_abstract_info(&base_board);
@@ -2786,10 +5604,11 @@ fn run_search(
         return Ok(());
     }
     let _ = tx.send(Message::Log(format!(
-        "抽象ラベル={} / 彩色候補={} / 4個消しモード={} / 計測={}",
+        "抽象ラベル={} / 彩色候補={} / 4個消しモード={} / free-top E1限定={} / 計測={}",
         info.labels.iter().collect::<String>(),
         colorings.len(),
         if exact_four_only { "ON" } else { "OFF" },
+        if require_free_top_e1 { "ON" } else { "OFF" },
         if profile_enabled { "ON" } else { "OFF" }
     )));
 
@@ -3045,6 +5864,7 @@ fn run_search(
                             order,
                             threshold,
                             exact_four_only,
+                            require_free_top_e1,
                             &mut memo,
                             &mut local_output_once,
                             &global_output_once,
@@ -3126,6 +5946,7 @@ fn run_search(
                                 order,
                                 threshold,
                                 exact_four_only,
+                                require_free_top_e1,
                                 &mut memo,
                                 &mut local_output_once,
                                 &global_output_once,
