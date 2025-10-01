@@ -1,5 +1,3 @@
-
-
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -12,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use dashmap::{DashMap, DashSet};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2};
 use num_bigint::BigUint;
-use num_traits::{One, Zero, ToPrimitive};
+use num_traits::{One, ToPrimitive, Zero};
+use rand::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
-use dashmap::{DashMap, DashSet};
-use rand::Rng;
 
 // u64 キー専用のノーハッシュ（高速化）
 use nohash_hasher::BuildNoHashHasher;
@@ -33,12 +31,12 @@ const W: usize = 6;
 const H: usize = 14;
 const MASK14: u16 = (1u16 << H) - 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Cell {
-    Blank,   // '.'
-    Any,     // 'N' (空白 or 色)
-    Any4,    // 'X' (色のみ)
-    Abs(u8), // 0..12 = 'A'..'M'
+    Blank,     // '.'
+    Any,       // 'N' (空白 or 色)
+    Any4,      // 'X' (色のみ)
+    Abs(u8),   // 0..12 = 'A'..'M'
     Fixed(u8), // 0..=3 = '0'..'3' (RGBY固定)
 }
 
@@ -87,8 +85,8 @@ struct DfsDepthTimes {
     // 葉専用
     leaf_fall_pre: Duration,
     leaf_hash: Duration,
-    leaf_memo_get: Duration,           // 今回の最適化後はほぼ0のまま
-    leaf_memo_miss_compute: Duration,  // 到達判定（reaches_t...）
+    leaf_memo_get: Duration,          // 今回の最適化後はほぼ0のまま
+    leaf_memo_miss_compute: Duration, // 到達判定（reaches_t...）
     out_serialize: Duration,
 }
 #[derive(Default, Clone, Copy)]
@@ -98,9 +96,9 @@ struct DfsDepthCounts {
     pruned_upper: u64,
     leaves: u64,
     // 葉早期リターン（落下や到達判定より前）
-    leaf_pre_tshort: u64,          // 4T 未満で不可能
-    leaf_pre_e1_impossible: u64,   // E1 不可能（4連結なし）
-    memo_lhit: u64, // 以降は基本0（残しつつ非使用）
+    leaf_pre_tshort: u64,        // 4T 未満で不可能
+    leaf_pre_e1_impossible: u64, // E1 不可能（4連結なし）
+    memo_lhit: u64,              // 以降は基本0（残しつつ非使用）
     memo_ghit: u64,
     memo_miss: u64,
 }
@@ -338,6 +336,12 @@ struct AnimState {
 }
 
 // 連鎖生成モードのワーク
+#[derive(Clone)]
+struct GeneratedChain {
+    board: [[u16; W]; 4],
+    chains: u32,
+}
+
 struct ChainPlay {
     cols: [[u16; W]; 4],
     pair_seq: Vec<(u8, u8)>, // 軸, 子（0..=3）
@@ -348,6 +352,9 @@ struct ChainPlay {
     // アニメ表示用：消去直後の盤面と、落下後の次盤面
     erased_cols: Option<[[u16; W]; 4]>,
     next_cols: Option<[[u16; W]; 4]>,
+    generated_base: Option<GeneratedChain>,
+    generated_head: Option<GeneratedChain>,
+    generated_back: Option<GeneratedChain>,
 }
 
 impl Default for ChainPlay {
@@ -358,7 +365,10 @@ impl Default for ChainPlay {
             seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
         }
         let cols = [[0u16; W]; 4];
-        let s0 = SavedState { cols, pair_index: 0 };
+        let s0 = SavedState {
+            cols,
+            pair_index: 0,
+        };
         Self {
             cols,
             pair_seq: seq,
@@ -368,12 +378,20 @@ impl Default for ChainPlay {
             lock: false,
             erased_cols: None,
             next_cols: None,
+            generated_base: None,
+            generated_head: None,
+            generated_back: None,
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Orient { Up, Right, Down, Left }
+enum Orient {
+    Up,
+    Right,
+    Down,
+    Left,
+}
 
 fn install_japanese_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
@@ -400,7 +418,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
         let path = fontdir.join(name);
         if let Ok(bytes) = std::fs::read(&path) {
             let key = format!("jp-{}", name.to_lowercase());
-            fonts.font_data.insert(key.clone(), FontData::from_owned(bytes));
+            fonts
+                .font_data
+                .insert(key.clone(), FontData::from_owned(bytes));
             fonts
                 .families
                 .get_mut(&FontFamily::Proportional)
@@ -419,7 +439,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
     if loaded {
         ctx.set_fonts(fonts);
     } else {
-        eprintln!("日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。");
+        eprintln!(
+            "日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。"
+        );
     }
 }
 
@@ -597,6 +619,68 @@ impl eframe::App for App {
                             }
                         });
                         ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+
+                        let can_ops = !self.cp.lock && self.cp.anim.is_none();
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(can_ops, egui::Button::new("総当たり連鎖生成"))
+                            .clicked()
+                        {
+                            self.cp_run_bruteforce_generation();
+                        }
+
+                        let mut apply_chain: Option<GeneratedChain> = None;
+                        if let Some(base_ref) = self.cp.generated_base.as_ref() {
+                            let mut apply = false;
+                            ui.horizontal(|ui| {
+                                ui.label(format!("基礎2連鎖: {}連鎖", base_ref.chains));
+                                if ui
+                                    .add_enabled(can_ops, egui::Button::new("盤面に適用"))
+                                    .clicked()
+                                {
+                                    apply = true;
+                                }
+                            });
+                            if apply {
+                                apply_chain = Some(base_ref.clone());
+                            }
+                        }
+
+                        if let Some(head_ref) = self.cp.generated_head.as_ref() {
+                            let mut apply = false;
+                            ui.horizontal(|ui| {
+                                ui.label(format!("頭伸ばし最大: {}連鎖", head_ref.chains));
+                                if ui
+                                    .add_enabled(can_ops, egui::Button::new("盤面に適用"))
+                                    .clicked()
+                                {
+                                    apply = true;
+                                }
+                            });
+                            if apply {
+                                apply_chain = Some(head_ref.clone());
+                            }
+                        }
+
+                        if let Some(back_ref) = self.cp.generated_back.as_ref() {
+                            let mut apply = false;
+                            ui.horizontal(|ui| {
+                                ui.label(format!("後ろ伸ばし最大: {}連鎖", back_ref.chains));
+                                if ui
+                                    .add_enabled(can_ops, egui::Button::new("盤面に適用"))
+                                    .clicked()
+                                {
+                                    apply = true;
+                                }
+                            });
+                            if apply {
+                                apply_chain = Some(back_ref.clone());
+                            }
+                        }
+
+                        if let Some(chain) = apply_chain {
+                            self.cp_apply_generated(&chain);
+                        }
                     });
                 }
 
@@ -674,49 +758,51 @@ impl eframe::App for App {
 
         // 盤面側もスクロール可能に
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                if self.mode == Mode::BruteForce {
-                    ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
-                    ui.add_space(6.0);
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if self.mode == Mode::BruteForce {
+                        ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
+                        ui.add_space(6.0);
 
-                    let cell_size = Vec2::new(28.0, 28.0);
-                    let gap = 2.0;
+                        let cell_size = Vec2::new(28.0, 28.0);
+                        let gap = 2.0;
 
-                    let shift_pressed = ui.input(|i| i.modifiers.shift);
-                    for y in (0..H).rev() {
-                        ui.horizontal(|ui| {
-                            for x in 0..W {
-                                let i = y * W + x;
-                                let (text, fill, stroke) = cell_style(self.board[i]);
-                                let btn = egui::Button::new(RichText::new(text).size(12.0))
-                                    .min_size(cell_size)
-                                    .fill(fill)
-                                    .stroke(stroke);
-                                let resp = ui.add(btn);
-                                if resp.clicked_by(egui::PointerButton::Primary) {
-                                    if shift_pressed {
-                                        self.board[i] = cycle_fixed(self.board[i]);
-                                    } else {
-                                        self.board[i] = cycle_abs(self.board[i]);
+                        let shift_pressed = ui.input(|i| i.modifiers.shift);
+                        for y in (0..H).rev() {
+                            ui.horizontal(|ui| {
+                                for x in 0..W {
+                                    let i = y * W + x;
+                                    let (text, fill, stroke) = cell_style(self.board[i]);
+                                    let btn = egui::Button::new(RichText::new(text).size(12.0))
+                                        .min_size(cell_size)
+                                        .fill(fill)
+                                        .stroke(stroke);
+                                    let resp = ui.add(btn);
+                                    if resp.clicked_by(egui::PointerButton::Primary) {
+                                        if shift_pressed {
+                                            self.board[i] = cycle_fixed(self.board[i]);
+                                        } else {
+                                            self.board[i] = cycle_abs(self.board[i]);
+                                        }
                                     }
+                                    if resp.clicked_by(egui::PointerButton::Middle) {
+                                        self.board[i] = cycle_any(self.board[i]);
+                                    }
+                                    if resp.clicked_by(egui::PointerButton::Secondary) {
+                                        self.board[i] = Cell::Blank;
+                                    }
+                                    ui.add_space(gap);
                                 }
-                                if resp.clicked_by(egui::PointerButton::Middle) {
-                                    self.board[i] = cycle_any(self.board[i]);
-                                }
-                                if resp.clicked_by(egui::PointerButton::Secondary) {
-                                    self.board[i] = Cell::Blank;
-                                }
-                                ui.add_space(gap);
-                            }
-                        });
-                        ui.add_space(gap);
+                            });
+                            ui.add_space(gap);
+                        }
+                    } else {
+                        ui.label("連鎖生成 — 盤面");
+                        ui.add_space(6.0);
+                        draw_preview(ui, &self.cp.cols);
                     }
-                } else {
-                    ui.label("連鎖生成 — 盤面");
-                    ui.add_space(6.0);
-                    draw_preview(ui, &self.cp.cols);
-                }
-            });
+                });
         });
 
         ctx.request_repaint_after(Duration::from_millis(16));
@@ -755,10 +841,15 @@ impl App {
     }
 
     fn cp_reset_to_initial(&mut self) {
-        if self.cp.lock { return; }
+        if self.cp.lock {
+            return;
+        }
         self.cp.anim = None;
         self.cp.erased_cols = None;
         self.cp.next_cols = None;
+        self.cp.generated_base = None;
+        self.cp.generated_head = None;
+        self.cp.generated_back = None;
         if let Some(first) = self.cp.undo_stack.first().copied() {
             self.cp.cols = first.cols;
             self.cp.pair_index = first.pair_index;
@@ -770,9 +861,18 @@ impl App {
     }
 
     fn cp_place_random(&mut self) {
-        if self.cp.lock || self.cp.anim.is_some() { return; }
+        if self.cp.lock || self.cp.anim.is_some() {
+            return;
+        }
         // 事前スナップショット
-        self.cp.undo_stack.push(SavedState { cols: self.cp.cols, pair_index: self.cp.pair_index });
+        self.cp.undo_stack.push(SavedState {
+            cols: self.cp.cols,
+            pair_index: self.cp.pair_index,
+        });
+
+        self.cp.generated_base = None;
+        self.cp.generated_head = None;
+        self.cp.generated_back = None;
 
         let pair = self.cp_current_pair();
         let mut rng = rand::thread_rng();
@@ -782,18 +882,25 @@ impl App {
         for x in 0..W {
             // 垂直（Up/Down）: 同一列に2個置けるか
             let h = self.cp_col_height(x);
-            if h + 1 < H { moves.push((x, Orient::Up)); moves.push((x, Orient::Down)); }
+            if h + 1 < H {
+                moves.push((x, Orient::Up));
+                moves.push((x, Orient::Down));
+            }
             // 右
             if x + 1 < W {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x + 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Right)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Right));
+                }
             }
             // 左
             if x >= 1 {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x - 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Left)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Left));
+                }
             }
         }
         if moves.is_empty() {
@@ -842,12 +949,16 @@ impl App {
     }
 
     fn cp_col_height(&self, x: usize) -> usize {
-        let occ = (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x]) & MASK14;
+        let occ =
+            (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x])
+                & MASK14;
         occ.count_ones() as usize
     }
 
     fn cp_set_cell(&mut self, x: usize, y: usize, color: u8) {
-        if x >= W || y >= H { return; }
+        if x >= W || y >= H {
+            return;
+        }
         let bit = 1u16 << y;
         let c = (color as usize).min(3);
         self.cp.cols[c][x] |= bit;
@@ -869,19 +980,29 @@ impl App {
         self.cp.erased_cols = Some(erased);
         self.cp.next_cols = Some(next);
         self.cp.cols = erased; // 消えた状態を表示
-        self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+        self.cp.anim = Some(AnimState {
+            phase: AnimPhase::AfterErase,
+            since: Instant::now(),
+        });
     }
 
     fn cp_step_animation(&mut self) {
-        let Some(anim) = self.cp.anim else { return; };
+        let Some(anim) = self.cp.anim else {
+            return;
+        };
         let elapsed = anim.since.elapsed();
-        if elapsed < Duration::from_millis(500) { return; }
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
         match anim.phase {
             AnimPhase::AfterErase => {
                 if let Some(next) = self.cp.next_cols.take() {
                     self.cp.cols = next;
                 }
-                self.cp.anim = Some(AnimState { phase: AnimPhase::AfterFall, since: Instant::now() });
+                self.cp.anim = Some(AnimState {
+                    phase: AnimPhase::AfterFall,
+                    since: Instant::now(),
+                });
                 // 次の消去準備は AfterFall 経由
             }
             AnimPhase::AfterFall => {
@@ -900,10 +1021,72 @@ impl App {
                     self.cp.cols = erased;
                     self.cp.erased_cols = Some(erased);
                     self.cp.next_cols = Some(next);
-                    self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+                    self.cp.anim = Some(AnimState {
+                        phase: AnimPhase::AfterErase,
+                        since: Instant::now(),
+                    });
                 }
             }
         }
+    }
+
+    fn cp_run_bruteforce_generation(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() {
+            return;
+        }
+        let (result, stats) = brute_force_generate_chain_extensions();
+        match result {
+            Some(res) => {
+                self.cp.generated_base = res.base;
+                self.cp.generated_head = res.head;
+                self.cp.generated_back = res.back;
+            }
+            None => {
+                self.cp.generated_base = None;
+                self.cp.generated_head = None;
+                self.cp.generated_back = None;
+            }
+        }
+        self.push_log(format!(
+            "総当たりデバッグ: 盤面候補 {} 件 (2連鎖 {} 件) / 頭候補 {} 件 / 後ろ候補 {} 件",
+            stats.base_board_candidates,
+            stats.base_two_chain,
+            stats.head_blocks_considered,
+            stats.back_blocks_considered,
+        ));
+        self.push_log(format!(
+            "テンプレ展開: lookup {} (hit {} / miss {} / 実計算 {}) / 展開盤面 {} (最大 {}) / キャッシュ最大 {} 件",
+            stats.template_cache_lookups,
+            stats.template_cache_hits,
+            stats.template_cache_misses,
+            stats.template_evaluations,
+            stats.template_board_evaluations,
+            stats.max_template_board_evaluations,
+            stats.cache_size_peak,
+        ));
+        self.push_log(format!(
+            "経過時間: 総計 {} / 落下シミュ {} / 頭分析 {} / 後ろ分析 {} / テンプレ列挙 {}",
+            fmt_dur_ms(stats.total_elapsed),
+            fmt_dur_ms(stats.simulation_elapsed),
+            fmt_dur_ms(stats.head_analysis_elapsed),
+            fmt_dur_ms(stats.back_analysis_elapsed),
+            fmt_dur_ms(stats.template_evaluation_elapsed),
+        ));
+    }
+
+    fn cp_apply_generated(&mut self, chain: &GeneratedChain) {
+        let board = chain.board;
+        self.cp.anim = None;
+        self.cp.lock = false;
+        self.cp.erased_cols = None;
+        self.cp.next_cols = None;
+        self.cp.cols = board;
+        self.cp.pair_index = 0;
+        self.cp.undo_stack.clear();
+        self.cp.undo_stack.push(SavedState {
+            cols: board,
+            pair_index: 0,
+        });
     }
 }
 
@@ -972,7 +1155,9 @@ impl App {
 }
 
 fn has_profile_any(p: &ProfileTotals) -> bool {
-    if p.io_write_total != Duration::ZERO { return true; }
+    if p.io_write_total != Duration::ZERO {
+        return true;
+    }
     for i in 0..=W {
         let t = p.dfs_times[i];
         if t.gen_candidates != Duration::ZERO
@@ -983,13 +1168,22 @@ fn has_profile_any(p: &ProfileTotals) -> bool {
             || t.leaf_memo_get != Duration::ZERO
             || t.leaf_memo_miss_compute != Duration::ZERO
             || t.out_serialize != Duration::ZERO
-        { return true; }
+        {
+            return true;
+        }
         let c = p.dfs_counts[i];
-        if c.nodes != 0 || c.cand_generated != 0 || c.pruned_upper != 0
+        if c.nodes != 0
+            || c.cand_generated != 0
+            || c.pruned_upper != 0
             || c.leaves != 0
             || c.leaf_pre_tshort != 0
             || c.leaf_pre_e1_impossible != 0
-            || c.memo_lhit != 0 || c.memo_ghit != 0 || c.memo_miss != 0 { return true; }
+            || c.memo_lhit != 0
+            || c.memo_ghit != 0
+            || c.memo_miss != 0
+        {
+            return true;
+        }
     }
     false
 }
@@ -1004,53 +1198,60 @@ fn fmt_dur_ms(d: Duration) -> String {
 }
 
 fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
-    ui.monospace(format!("I/O 書き込み合計: {}", fmt_dur_ms(p.io_write_total)));
+    ui.monospace(format!(
+        "I/O 書き込み合計: {}",
+        fmt_dur_ms(p.io_write_total)
+    ));
     ui.add_space(4.0);
-    egui::Grid::new("profile-grid").striped(true).num_columns(16).show(ui, |ui| {
-        ui.monospace("深さ");
-        ui.monospace("nodes");
-        ui.monospace("cand");
-        ui.monospace("pruned");
-        ui.monospace("leaves");
-        ui.monospace("pre_thres");
-        ui.monospace("pre_e1ng");
-        ui.monospace("L-hit");
-        ui.monospace("G-hit");
-        ui.monospace("Miss");
-        ui.monospace("gen");
-        ui.monospace("assign");
-        ui.monospace("upper");
-        ui.monospace("fall");
-        ui.monospace("hash");
-        ui.monospace("memo_get/miss_compute/out");
-        ui.end_row();
-
-        for d in 0..=W {
-            let c = p.dfs_counts[d];
-            let t = p.dfs_times[d];
-            ui.monospace(format!("{:>2}", d));
-            ui.monospace(format!("{}", c.nodes));
-            ui.monospace(format!("{}", c.cand_generated));
-            ui.monospace(format!("{}", c.pruned_upper));
-            ui.monospace(format!("{}", c.leaves));
-            ui.monospace(format!("{}", c.leaf_pre_tshort));
-            ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
-            ui.monospace(format!("{}", c.memo_lhit));
-            ui.monospace(format!("{}", c.memo_ghit));
-            ui.monospace(format!("{}", c.memo_miss));
-            ui.monospace(fmt_dur_ms(t.gen_candidates));
-            ui.monospace(fmt_dur_ms(t.assign_cols));
-            ui.monospace(fmt_dur_ms(t.upper_bound));
-            ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
-            ui.monospace(fmt_dur_ms(t.leaf_hash));
-            ui.monospace(format!("{} / {} / {}",
-                fmt_dur_ms(t.leaf_memo_get),
-                fmt_dur_ms(t.leaf_memo_miss_compute),
-                fmt_dur_ms(t.out_serialize),
-            ));
+    egui::Grid::new("profile-grid")
+        .striped(true)
+        .num_columns(16)
+        .show(ui, |ui| {
+            ui.monospace("深さ");
+            ui.monospace("nodes");
+            ui.monospace("cand");
+            ui.monospace("pruned");
+            ui.monospace("leaves");
+            ui.monospace("pre_thres");
+            ui.monospace("pre_e1ng");
+            ui.monospace("L-hit");
+            ui.monospace("G-hit");
+            ui.monospace("Miss");
+            ui.monospace("gen");
+            ui.monospace("assign");
+            ui.monospace("upper");
+            ui.monospace("fall");
+            ui.monospace("hash");
+            ui.monospace("memo_get/miss_compute/out");
             ui.end_row();
-        }
-    });
+
+            for d in 0..=W {
+                let c = p.dfs_counts[d];
+                let t = p.dfs_times[d];
+                ui.monospace(format!("{:>2}", d));
+                ui.monospace(format!("{}", c.nodes));
+                ui.monospace(format!("{}", c.cand_generated));
+                ui.monospace(format!("{}", c.pruned_upper));
+                ui.monospace(format!("{}", c.leaves));
+                ui.monospace(format!("{}", c.leaf_pre_tshort));
+                ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
+                ui.monospace(format!("{}", c.memo_lhit));
+                ui.monospace(format!("{}", c.memo_ghit));
+                ui.monospace(format!("{}", c.memo_miss));
+                ui.monospace(fmt_dur_ms(t.gen_candidates));
+                ui.monospace(fmt_dur_ms(t.assign_cols));
+                ui.monospace(fmt_dur_ms(t.upper_bound));
+                ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
+                ui.monospace(fmt_dur_ms(t.leaf_hash));
+                ui.monospace(format!(
+                    "{} / {} / {}",
+                    fmt_dur_ms(t.leaf_memo_get),
+                    fmt_dur_ms(t.leaf_memo_miss_compute),
+                    fmt_dur_ms(t.out_serialize),
+                ));
+                ui.end_row();
+            }
+        });
 }
 
 #[derive(Clone, Copy)]
@@ -1158,16 +1359,15 @@ fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
     let width = W as f32 * cell + (W - 1) as f32 * gap;
     let height = H as f32 * cell + (H - 1) as f32 * gap;
 
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     // 0=R, 1=G, 2=B, 3=Y
     let palette = [
-        Color32::from_rgb(239, 68, 68),   // red
-        Color32::from_rgb(34, 197, 94),   // green
-        Color32::from_rgb(59, 130, 246),  // blue
-        Color32::from_rgb(234, 179, 8),   // yellow
+        Color32::from_rgb(239, 68, 68),  // red
+        Color32::from_rgb(34, 197, 94),  // green
+        Color32::from_rgb(59, 130, 246), // blue
+        Color32::from_rgb(234, 179, 8),  // yellow
     ];
 
     for y in 0..H {
@@ -1356,7 +1556,9 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         let mut best_sat = -1i32;
         let mut best_deg = -1i32;
         for v in 0..color.len() {
-            if color[v] != 4 { continue; }
+            if color[v] != 4 {
+                continue;
+            }
             let sat = used_mask[v].count_ones() as i32;
             let deg = adj[v].count_ones() as i32;
             if sat > best_sat || (sat == best_sat && deg > best_deg) {
@@ -1370,9 +1572,13 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         // 使える色を列挙（4色から used を除く）+ 対称性破り
         let forbid = used_mask[v];
         let mut new_color_limit = (max_used + 1).min(3);
-        if vleft == total_n { new_color_limit = 0; } // 最初の1手は 0 のみ
+        if vleft == total_n {
+            new_color_limit = 0;
+        } // 最初の1手は 0 のみ
         for c in 0u8..=new_color_limit {
-            if ((forbid >> c) & 1) != 0 { continue; }
+            if ((forbid >> c) & 1) != 0 {
+                continue;
+            }
             color[v] = c;
 
             // 近傍の used_mask を更新
@@ -1387,7 +1593,15 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
                 }
             }
             let next_max_used = if c > max_used { c } else { max_used };
-            dfs(vleft - 1, total_n, adj, color, used_mask, out, next_max_used);
+            dfs(
+                vleft - 1,
+                total_n,
+                adj,
+                color,
+                used_mask,
+                out,
+                next_max_used,
+            );
 
             // ロールバック
             color[v] = 4;
@@ -1557,7 +1771,15 @@ fn stream_column_candidates_timed<F: FnMut([u16; 4])>(
     }
     let mut masks = [0u16; 4];
     let mut last_start = Instant::now();
-    rec(0, false, col, &mut masks, enum_time, &mut last_start, &mut yield_masks);
+    rec(
+        0,
+        false,
+        col,
+        &mut masks,
+        enum_time,
+        &mut last_start,
+        &mut yield_masks,
+    );
     *enum_time += last_start.elapsed();
 }
 
@@ -1614,7 +1836,9 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("bmi2") {
-            unsafe { return fall_cols_bmi2(cols_in); }
+            unsafe {
+                return fall_cols_bmi2(cols_in);
+            }
         }
     }
     fall_cols(cols_in)
@@ -1623,10 +1847,10 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn fall_cols_bmi2(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_pdep_u32, _pext_u32};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{_pdep_u32, _pext_u32};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_pdep_u32, _pext_u32};
 
     let mut out = [[0u16; W]; 4];
 
@@ -1835,6 +2059,405 @@ fn apply_erase_and_fall_exact4(cols: &[[u16; W]; 4]) -> StepExact {
     }
 }
 
+fn simulate_chain_steps(mut cols: [[u16; W]; 4], exact_four_only: bool) -> (u32, Vec<[u16; W]>) {
+    let mut chain = 0u32;
+    let mut masks = Vec::new();
+    loop {
+        if exact_four_only {
+            let (clear, had_ge5, had_four) = compute_erase_mask_and_flags(&cols);
+            if had_ge5 || !had_four {
+                break;
+            }
+            let any = (0..W).any(|x| clear[x] != 0);
+            if !any {
+                break;
+            }
+            masks.push(clear);
+            chain += 1;
+            cols = apply_given_clear_and_fall(&cols, &clear);
+        } else {
+            let clear = compute_erase_mask_cols(&cols);
+            let any = (0..W).any(|x| clear[x] != 0);
+            if !any {
+                break;
+            }
+            masks.push(clear);
+            chain += 1;
+            cols = apply_given_clear_and_fall(&cols, &clear);
+        }
+    }
+    (chain, masks)
+}
+
+fn cells_from_cols(cols: &[[u16; W]; 4]) -> Vec<Cell> {
+    let mut out = vec![Cell::Blank; W * H];
+    for x in 0..W {
+        for y in 0..H {
+            let bit = 1u16 << y;
+            let idx = y * W + x;
+            if cols[0][x] & bit != 0 {
+                out[idx] = Cell::Fixed(0);
+            } else if cols[1][x] & bit != 0 {
+                out[idx] = Cell::Fixed(1);
+            } else if cols[2][x] & bit != 0 {
+                out[idx] = Cell::Fixed(2);
+            } else if cols[3][x] & bit != 0 {
+                out[idx] = Cell::Fixed(3);
+            }
+        }
+    }
+    out
+}
+
+fn cell_to_tcell(cell: Cell) -> TCell {
+    match cell {
+        Cell::Blank => TCell::Blank,
+        Cell::Any => TCell::Any,
+        Cell::Any4 => TCell::Any4,
+        Cell::Abs(_) => TCell::Any4,
+        Cell::Fixed(c) => TCell::Fixed(c),
+    }
+}
+
+fn enumerate_boards_from_template<F>(template: &[Cell], mut callback: F)
+where
+    F: FnMut(&[[u16; W]; 4]),
+{
+    let mut cols_template = [[TCell::Blank; H]; W];
+    for x in 0..W {
+        for y in 0..H {
+            cols_template[x][y] = cell_to_tcell(template[y * W + x]);
+        }
+    }
+
+    let mut cols = [[0u16; W]; 4];
+
+    fn rec<F>(x: usize, cols_template: &[[TCell; H]; W], cols: &mut [[u16; W]; 4], callback: &mut F)
+    where
+        F: FnMut(&[[u16; W]; 4]),
+    {
+        if x >= W {
+            callback(cols);
+            return;
+        }
+        stream_column_candidates(&cols_template[x], |masks| {
+            assign_col_unrolled(cols, x, &masks);
+            rec(x + 1, cols_template, cols, callback);
+            clear_col_unrolled(cols, x);
+        });
+    }
+
+    rec(0, &cols_template, &mut cols, &mut callback);
+}
+
+type TemplateCache = HashMap<Vec<Cell>, Option<GeneratedChain>>;
+
+fn max_chain_for_template(
+    template: &[Cell],
+    cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
+) -> Option<GeneratedChain> {
+    let key: Vec<Cell> = template.to_vec();
+    stats.template_cache_lookups += 1;
+    if let Some(cached) = cache.get(&key) {
+        stats.template_cache_hits += 1;
+        return cached.clone();
+    }
+    stats.template_cache_misses += 1;
+
+    let mut best_chain = 0u32;
+    let mut best_board: Option<[[u16; W]; 4]> = None;
+    let mut boards_enumerated = 0u64;
+    let eval_start = Instant::now();
+    enumerate_boards_from_template(template, |cols| {
+        boards_enumerated += 1;
+        let (chains, _) = simulate_chain_steps(*cols, false);
+        if chains > best_chain || best_board.is_none() {
+            best_chain = chains;
+            best_board = Some(*cols);
+        }
+    });
+    stats.template_board_evaluations += boards_enumerated;
+    stats.max_template_board_evaluations =
+        stats.max_template_board_evaluations.max(boards_enumerated);
+    stats.template_evaluation_elapsed += eval_start.elapsed();
+    stats.template_evaluations += 1;
+
+    let result = best_board.map(|board| GeneratedChain {
+        board,
+        chains: best_chain,
+    });
+    cache.insert(key, result.clone());
+    stats.cache_size_peak = stats.cache_size_peak.max(cache.len());
+    result
+}
+
+fn head_blocks_for_cell(x: usize, y: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut blocks = Vec::new();
+    if y + 2 >= H {
+        return blocks;
+    }
+    for sx in x.saturating_sub(2)..=x {
+        if sx + 2 >= W {
+            continue;
+        }
+        let sy = y;
+        if sy + 2 >= H {
+            continue;
+        }
+        if x < sx || x > sx + 2 {
+            continue;
+        }
+        let mut block = Vec::with_capacity(9);
+        for dx in 0..3 {
+            for dy in 0..3 {
+                block.push((sx + dx, sy + dy));
+            }
+        }
+        if !blocks.contains(&block) {
+            blocks.push(block);
+        }
+    }
+    blocks
+}
+
+fn back_blocks_for_column(x: usize, y_top: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut blocks = Vec::new();
+    if y_top < 1 || y_top + 1 >= H {
+        return blocks;
+    }
+    let sy = y_top - 1;
+    if sy + 2 >= H {
+        return blocks;
+    }
+    for sx in x.saturating_sub(2)..=x {
+        if sx + 2 >= W {
+            continue;
+        }
+        if x < sx || x > sx + 2 {
+            continue;
+        }
+        let mut block = Vec::with_capacity(9);
+        for dx in 0..3 {
+            for dy in 0..3 {
+                block.push((sx + dx, sy + dy));
+            }
+        }
+        if !blocks.contains(&block) {
+            blocks.push(block);
+        }
+    }
+    blocks
+}
+
+fn analyze_head_extension(
+    base: &[[u16; W]; 4],
+    first_mask: &[u16; W],
+    cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
+) -> Option<GeneratedChain> {
+    let base_cells = cells_from_cols(base);
+    let mut best_board: Option<[[u16; W]; 4]> = None;
+    let mut best_chain = 0u32;
+    let call_start = Instant::now();
+    for x in 0..W {
+        let mut bits = first_mask[x];
+        while bits != 0 {
+            let y = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            for block in head_blocks_for_cell(x, y) {
+                stats.head_blocks_considered += 1;
+                let mut template = base_cells.clone();
+                for &(bx, by) in &block {
+                    if bx < W && by < H {
+                        template[by * W + bx] = Cell::Any;
+                    }
+                }
+                if let Some(res) = max_chain_for_template(&template, cache, stats) {
+                    if res.chains > best_chain || best_board.is_none() {
+                        best_chain = res.chains;
+                        best_board = Some(res.board);
+                    }
+                }
+            }
+        }
+    }
+    stats.head_analysis_elapsed += call_start.elapsed();
+    best_board.map(|board| GeneratedChain {
+        board,
+        chains: best_chain,
+    })
+}
+
+fn analyze_back_extension(
+    base: &[[u16; W]; 4],
+    second_mask: &[u16; W],
+    cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
+) -> Option<GeneratedChain> {
+    let base_cells = cells_from_cols(base);
+    let mut min_x = W;
+    let mut max_x = 0usize;
+    let mut has_any = false;
+    for x in 0..W {
+        if second_mask[x] != 0 {
+            has_any = true;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+        }
+    }
+    if !has_any {
+        return None;
+    }
+
+    let mut best_board: Option<[[u16; W]; 4]> = None;
+    let mut best_chain = 0u32;
+    let mut candidates = Vec::new();
+    candidates.push(min_x);
+    if max_x != min_x {
+        candidates.push(max_x);
+    }
+    let call_start = Instant::now();
+    for x in candidates {
+        if x >= W || second_mask[x] == 0 {
+            continue;
+        }
+        let mut bits = second_mask[x];
+        let mut top: Option<usize> = None;
+        while bits != 0 {
+            let y = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            top = Some(top.map_or(y, |cur| cur.max(y)));
+        }
+        let Some(y_top) = top else {
+            continue;
+        };
+        for block in back_blocks_for_column(x, y_top) {
+            stats.back_blocks_considered += 1;
+            let mut template = base_cells.clone();
+            for &(bx, by) in &block {
+                if bx < W && by < H {
+                    template[by * W + bx] = Cell::Any;
+                }
+            }
+            if let Some(res) = max_chain_for_template(&template, cache, stats) {
+                if res.chains > best_chain || best_board.is_none() {
+                    best_chain = res.chains;
+                    best_board = Some(res.board);
+                }
+            }
+        }
+    }
+    stats.back_analysis_elapsed += call_start.elapsed();
+    best_board.map(|board| GeneratedChain {
+        board,
+        chains: best_chain,
+    })
+}
+
+#[derive(Default, Clone, Debug)]
+struct GenerationDebugStats {
+    total_elapsed: Duration,
+    simulation_elapsed: Duration,
+    head_analysis_elapsed: Duration,
+    back_analysis_elapsed: Duration,
+    template_evaluation_elapsed: Duration,
+    base_board_candidates: u64,
+    base_two_chain: u64,
+    head_blocks_considered: u64,
+    back_blocks_considered: u64,
+    template_cache_lookups: u64,
+    template_cache_hits: u64,
+    template_cache_misses: u64,
+    template_evaluations: u64,
+    template_board_evaluations: u64,
+    max_template_board_evaluations: u64,
+    cache_size_peak: usize,
+}
+
+struct BruteForceGenerationResult {
+    base: Option<GeneratedChain>,
+    head: Option<GeneratedChain>,
+    back: Option<GeneratedChain>,
+}
+
+fn brute_force_generate_chain_extensions(
+) -> (Option<BruteForceGenerationResult>, GenerationDebugStats) {
+    let mut stats = GenerationDebugStats::default();
+    let overall_start = Instant::now();
+    let mut template = vec![Cell::Blank; W * H];
+    for x in 0..3 {
+        for y in 0..3 {
+            template[y * W + x] = Cell::Any4;
+        }
+    }
+
+    let mut first_base: Option<GeneratedChain> = None;
+    let mut best_head: Option<(GeneratedChain, GeneratedChain)> = None;
+    let mut best_back: Option<(GeneratedChain, GeneratedChain)> = None;
+    let mut cache: TemplateCache = HashMap::new();
+
+    enumerate_boards_from_template(&template, |cols| {
+        stats.base_board_candidates += 1;
+        let sim_start = Instant::now();
+        let (chains, masks) = simulate_chain_steps(*cols, false);
+        stats.simulation_elapsed += sim_start.elapsed();
+        if chains != 2 || masks.len() < 2 {
+            return;
+        }
+        stats.base_two_chain += 1;
+        let base = GeneratedChain {
+            board: *cols,
+            chains,
+        };
+        if first_base.is_none() {
+            first_base = Some(base.clone());
+        }
+        if let Some(head) =
+            analyze_head_extension(cols, &masks[0], &mut cache, &mut stats)
+        {
+            let update = match &best_head {
+                Some((_, current)) => head.chains > current.chains,
+                None => true,
+            };
+            if update {
+                best_head = Some((base.clone(), head));
+            }
+        }
+        if let Some(back) =
+            analyze_back_extension(cols, &masks[1], &mut cache, &mut stats)
+        {
+            let update = match &best_back {
+                Some((_, current)) => back.chains > current.chains,
+                None => true,
+            };
+            if update {
+                best_back = Some((base.clone(), back));
+            }
+        }
+    });
+
+    stats.total_elapsed = overall_start.elapsed();
+
+    if first_base.is_none() && best_head.is_none() && best_back.is_none() {
+        return (None, stats);
+    }
+
+    let base = best_head
+        .as_ref()
+        .map(|(b, _)| b.clone())
+        .or_else(|| best_back.as_ref().map(|(b, _)| b.clone()))
+        .or(first_base);
+
+    let head = best_head.map(|(_, h)| h);
+    let back = best_back.map(|(_, b)| b);
+
+    (
+        Some(BruteForceGenerationResult { base, head, back }),
+        stats,
+    )
+}
+
 // 列 x への 4色一括代入（ループ展開）
 #[inline(always)]
 fn assign_col_unrolled(cols: &mut [[u16; W]; 4], x: usize, masks: &[u16; 4]) {
@@ -1875,7 +2498,9 @@ fn reaches_t_from_pre_single_e1(pre: &[[u16; W]; 4], t: u32, exact_four_only: bo
         let mut clr: BB = 0;
         let mut tot: u32 = 0;
         for &bb in bb_pre.iter() {
-            if bb.count_ones() < 4 { continue; }
+            if bb.count_ones() < 4 {
+                continue;
+            }
             let mut s = bb;
             while s != 0 {
                 let seed = s & (!s + 1);
@@ -2165,7 +2790,11 @@ fn canonical_hash64_fast(cols: &[[u16; W]; 4]) -> (u64, bool) {
     } else {
         let h0 = canonical_hash64_oriented_bits(cols, false);
         let h1 = canonical_hash64_oriented_bits(cols, true);
-        if h0 <= h1 { (h0, false) } else { (h1, true) }
+        if h0 <= h1 {
+            (h0, false)
+        } else {
+            (h1, true)
+        }
     }
 }
 
@@ -2342,10 +2971,8 @@ struct ApproxLru {
 impl ApproxLru {
     fn new(limit: usize) -> Self {
         let cap = (limit.saturating_mul(11) / 10).max(16);
-        let map: U64Map<bool> = std::collections::HashMap::with_capacity_and_hasher(
-            cap,
-            BuildNoHashHasher::default(),
-        );
+        let map: U64Map<bool> =
+            std::collections::HashMap::with_capacity_and_hasher(cap, BuildNoHashHasher::default());
         let q = VecDeque::with_capacity(cap);
         Self { limit, map, q }
     }
@@ -2457,9 +3084,11 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].memo_miss += 1;
         }
         *mmiss_batch += 1;
-        let reached = prof!(profile_enabled, time_batch.dfs_times[depth].leaf_memo_miss_compute, {
-            reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only)
-        });
+        let reached = prof!(
+            profile_enabled,
+            time_batch.dfs_times[depth].leaf_memo_miss_compute,
+            { reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only) }
+        );
         if !reached {
             // 統計フラッシュ（従来通り）
             if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
@@ -2530,12 +3159,23 @@ fn dfs_combine_parallel(
                 }
 
                 // 出力整形
-                let line = prof!(profile_enabled, time_batch.dfs_times[depth].out_serialize, {
-                    let key_str = encode_canonical_string(&pre, mirror);
-                    let hash = fnv1a32(&key_str);
-                    let rows = serialize_board_from_cols(&pre);
-                    make_json_line_str(&key_str, hash, threshold, &rows, map_label_to_color, mirror)
-                });
+                let line = prof!(
+                    profile_enabled,
+                    time_batch.dfs_times[depth].out_serialize,
+                    {
+                        let key_str = encode_canonical_string(&pre, mirror);
+                        let hash = fnv1a32(&key_str);
+                        let rows = serialize_board_from_cols(&pre);
+                        make_json_line_str(
+                            &key_str,
+                            hash,
+                            threshold,
+                            &rows,
+                            map_label_to_color,
+                            mirror,
+                        )
+                    }
+                );
                 batch.push(line);
                 *outputs_batch += 1;
 
@@ -2594,9 +3234,23 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].pruned_upper += 1;
         }
         if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-            && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+            && (*nodes_batch > 0
+                || *leaves_batch > 0
+                || *outputs_batch > 0
+                || *pruned_batch > 0
+                || *lhit_batch > 0
+                || *ghit_batch > 0
+                || *mmiss_batch > 0)
         {
-            let _ = stat_sender.send(StatDelta { nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch, pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch });
+            let _ = stat_sender.send(StatDelta {
+                nodes: *nodes_batch,
+                leaves: *leaves_batch,
+                outputs: *outputs_batch,
+                pruned: *pruned_batch,
+                lhit: *lhit_batch,
+                ghit: *ghit_batch,
+                mmiss: *mmiss_batch,
+            });
             *nodes_batch = 0;
             *leaves_batch = 0;
             *outputs_batch = 0;
@@ -2798,7 +3452,8 @@ fn run_search(
         let bmi2 = std::is_x86_feature_detected!("bmi2");
         let popcnt = std::is_x86_feature_detected!("popcnt");
         let _ = tx.send(Message::Log(format!(
-            "CPU features: bmi2={} / popcnt={}", bmi2, popcnt
+            "CPU features: bmi2={} / popcnt={}",
+            bmi2, popcnt
         )));
     }
 
@@ -2879,9 +3534,11 @@ fn run_search(
     let tx_progress = tx.clone();
     let total_clone = total.clone();
     let abort_for_agg = abort.clone();
-    let global_output_once: Arc<DU64Set> = Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
+    let global_output_once: Arc<DU64Set> =
+        Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
     // グローバル memo は get を廃止（挿入もしない方針）
-    let global_memo: Arc<DU64Map<bool>> = Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
+    let global_memo: Arc<DU64Map<bool>> =
+        Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
 
     let global_memo_for_agg = global_memo.clone();
     let lru_limit_for_agg = lru_limit;
@@ -2991,10 +3648,8 @@ fn run_search(
     });
 
     // metas を並列探索
-    metas
-        .par_iter()
-        .enumerate()
-        .try_for_each(|(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
+    metas.par_iter().enumerate().try_for_each(
+        |(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
             if abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -3019,10 +3674,15 @@ fn run_search(
                 first_candidates
                     .par_iter()
                     .try_for_each(|masks| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         let mut cols0 = [[0u16; W]; 4];
-                        for c in 0..4 { cols0[c][first_x] = masks[c]; }
-                        let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                        for c in 0..4 {
+                            cols0[c][first_x] = masks[c];
+                        }
+                        let mut memo =
+                            ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                         let mut local_output_once: U64Set = U64Set::default();
                         let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3072,9 +3732,26 @@ fn run_search(
                             &remain_suffix,
                         );
 
-                        if !batch.is_empty() { let _ = wtx.send(batch); }
-                        if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                            let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                        if !batch.is_empty() {
+                            let _ = wtx.send(batch);
+                        }
+                        if nodes_batch > 0
+                            || leaves_batch > 0
+                            || outputs_batch > 0
+                            || pruned_batch > 0
+                            || lhit_batch > 0
+                            || ghit_batch > 0
+                            || mmiss_batch > 0
+                        {
+                            let _ = stx.send(StatDelta {
+                                nodes: nodes_batch,
+                                leaves: leaves_batch,
+                                outputs: outputs_batch,
+                                pruned: pruned_batch,
+                                lhit: lhit_batch,
+                                ghit: ghit_batch,
+                                mmiss: mmiss_batch,
+                            });
                         }
                         if profile_enabled && time_delta_has_any(&time_batch) {
                             let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3094,16 +3771,21 @@ fn run_search(
                 second_candidates
                     .par_iter()
                     .try_for_each(|m2| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         for masks in &first_candidates {
-                            if abort.load(Ordering::Relaxed) { break; }
+                            if abort.load(Ordering::Relaxed) {
+                                break;
+                            }
 
                             let mut cols0 = [[0u16; W]; 4];
                             for c in 0..4 {
                                 cols0[c][first_x] = masks[c];
                                 cols0[c][second_x] = m2[c];
                             }
-                            let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                            let mut memo =
+                                ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                             let mut local_output_once: U64Set = U64Set::default();
                             let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3118,7 +3800,9 @@ fn run_search(
 
                             let mut time_batch = TimeDelta::default();
 
-                            let placed2: u32 = (0..4).map(|c| masks[c].count_ones() + m2[c].count_ones()).sum();
+                            let placed2: u32 = (0..4)
+                                .map(|c| masks[c].count_ones() + m2[c].count_ones())
+                                .sum();
                             let _ = dfs_combine_parallel(
                                 2,
                                 &mut cols0,
@@ -3153,9 +3837,26 @@ fn run_search(
                                 &remain_suffix,
                             );
 
-                            if !batch.is_empty() { let _ = wtx.send(batch); }
-                            if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                                let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                            if !batch.is_empty() {
+                                let _ = wtx.send(batch);
+                            }
+                            if nodes_batch > 0
+                                || leaves_batch > 0
+                                || outputs_batch > 0
+                                || pruned_batch > 0
+                                || lhit_batch > 0
+                                || ghit_batch > 0
+                                || mmiss_batch > 0
+                            {
+                                let _ = stx.send(StatDelta {
+                                    nodes: nodes_batch,
+                                    leaves: leaves_batch,
+                                    outputs: outputs_batch,
+                                    pruned: pruned_batch,
+                                    lhit: lhit_batch,
+                                    ghit: ghit_batch,
+                                    mmiss: mmiss_batch,
+                                });
                             }
                             if profile_enabled && time_delta_has_any(&time_batch) {
                                 let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3165,11 +3866,14 @@ fn run_search(
                     })?;
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     drop(wtx);
     drop(stx);
-    let writer_result = writer_handle.join().map_err(|_| anyhow!("writer join error"))?;
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer join error"))?;
     writer_result?;
     agg_handle.join().map_err(|_| anyhow!("agg join error"))?;
 
@@ -3179,8 +3883,7 @@ fn run_search(
 // ユーティリティ：配列初期化（const generics）
 fn array_init<T, F: FnMut(usize) -> T, const N: usize>(mut f: F) -> [T; N] {
     use std::mem::MaybeUninit;
-    let mut data: [MaybeUninit<T>; N] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+    let mut data: [MaybeUninit<T>; N] = unsafe { MaybeUninit::uninit().assume_init() };
     for (i, slot) in data.iter_mut().enumerate() {
         slot.write(f(i));
     }
