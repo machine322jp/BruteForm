@@ -31,7 +31,7 @@ const W: usize = 6;
 const H: usize = 14;
 const MASK14: u16 = (1u16 << H) - 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Cell {
     Blank,     // '.'
     Any,       // 'N' (空白 or 色)
@@ -2124,7 +2124,14 @@ where
     rec(0, &cols_template, &mut cols, &mut callback);
 }
 
-fn max_chain_for_template(template: &[Cell]) -> (u32, Option<[[u16; W]; 4]>) {
+type TemplateCache = HashMap<Vec<Cell>, Option<GeneratedChain>>;
+
+fn max_chain_for_template(template: &[Cell], cache: &mut TemplateCache) -> Option<GeneratedChain> {
+    let key: Vec<Cell> = template.to_vec();
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     let mut best_chain = 0u32;
     let mut best_board: Option<[[u16; W]; 4]> = None;
     enumerate_boards_from_template(template, |cols| {
@@ -2134,7 +2141,13 @@ fn max_chain_for_template(template: &[Cell]) -> (u32, Option<[[u16; W]; 4]>) {
             best_board = Some(*cols);
         }
     });
-    (best_chain, best_board)
+
+    let result = best_board.map(|board| GeneratedChain {
+        board,
+        chains: best_chain,
+    });
+    cache.insert(key, result.clone());
+    result
 }
 
 fn head_blocks_for_cell(x: usize, y: usize) -> Vec<Vec<(usize, usize)>> {
@@ -2195,7 +2208,11 @@ fn back_blocks_for_column(x: usize, y_top: usize) -> Vec<Vec<(usize, usize)>> {
     blocks
 }
 
-fn analyze_head_extension(base: &[[u16; W]; 4], first_mask: &[u16; W]) -> Option<GeneratedChain> {
+fn analyze_head_extension(
+    base: &[[u16; W]; 4],
+    first_mask: &[u16; W],
+    cache: &mut TemplateCache,
+) -> Option<GeneratedChain> {
     let base_cells = cells_from_cols(base);
     let mut best_board: Option<[[u16; W]; 4]> = None;
     let mut best_chain = 0u32;
@@ -2211,11 +2228,10 @@ fn analyze_head_extension(base: &[[u16; W]; 4], first_mask: &[u16; W]) -> Option
                         template[by * W + bx] = Cell::Any;
                     }
                 }
-                let (chains, board_opt) = max_chain_for_template(&template);
-                if let Some(board) = board_opt {
-                    if chains > best_chain || best_board.is_none() {
-                        best_chain = chains;
-                        best_board = Some(board);
+                if let Some(res) = max_chain_for_template(&template, cache) {
+                    if res.chains > best_chain || best_board.is_none() {
+                        best_chain = res.chains;
+                        best_board = Some(res.board);
                     }
                 }
             }
@@ -2227,7 +2243,11 @@ fn analyze_head_extension(base: &[[u16; W]; 4], first_mask: &[u16; W]) -> Option
     })
 }
 
-fn analyze_back_extension(base: &[[u16; W]; 4], second_mask: &[u16; W]) -> Option<GeneratedChain> {
+fn analyze_back_extension(
+    base: &[[u16; W]; 4],
+    second_mask: &[u16; W],
+    cache: &mut TemplateCache,
+) -> Option<GeneratedChain> {
     let base_cells = cells_from_cols(base);
     let mut min_x = W;
     let mut max_x = 0usize;
@@ -2271,11 +2291,10 @@ fn analyze_back_extension(base: &[[u16; W]; 4], second_mask: &[u16; W]) -> Optio
                     template[by * W + bx] = Cell::Any;
                 }
             }
-            let (chains, board_opt) = max_chain_for_template(&template);
-            if let Some(board) = board_opt {
-                if chains > best_chain || best_board.is_none() {
-                    best_chain = chains;
-                    best_board = Some(board);
+            if let Some(res) = max_chain_for_template(&template, cache) {
+                if res.chains > best_chain || best_board.is_none() {
+                    best_chain = res.chains;
+                    best_board = Some(res.board);
                 }
             }
         }
@@ -2303,6 +2322,7 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
     let mut first_base: Option<GeneratedChain> = None;
     let mut best_head: Option<(GeneratedChain, GeneratedChain)> = None;
     let mut best_back: Option<(GeneratedChain, GeneratedChain)> = None;
+    let mut cache: TemplateCache = HashMap::new();
 
     enumerate_boards_from_template(&template, |cols| {
         let (chains, masks) = simulate_chain_steps(*cols, false);
@@ -2316,7 +2336,7 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
         if first_base.is_none() {
             first_base = Some(base.clone());
         }
-        if let Some(head) = analyze_head_extension(cols, &masks[0]) {
+        if let Some(head) = analyze_head_extension(cols, &masks[0], &mut cache) {
             let update = match &best_head {
                 Some((_, current)) => head.chains > current.chains,
                 None => true,
@@ -2325,7 +2345,7 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
                 best_head = Some((base.clone(), head));
             }
         }
-        if let Some(back) = analyze_back_extension(cols, &masks[1]) {
+        if let Some(back) = analyze_back_extension(cols, &masks[1], &mut cache) {
             let update = match &best_back {
                 Some((_, current)) => back.chains > current.chains,
                 None => true,
