@@ -375,6 +375,34 @@ impl Default for ChainPlay {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AutoTargetCandidate {
+    target: [[u16; W]; 4],
+    chains: u32,
+    matches: usize,
+    score: i32,
+    base_y: usize,
+    origin_x: usize,
+}
+
+impl AutoTargetCandidate {
+    fn better_than(&self, other: &Self) -> bool {
+        if self.chains != other.chains {
+            return self.chains > other.chains;
+        }
+        if self.matches != other.matches {
+            return self.matches > other.matches;
+        }
+        if self.score != other.score {
+            return self.score > other.score;
+        }
+        if self.base_y != other.base_y {
+            return self.base_y < other.base_y;
+        }
+        self.origin_x < other.origin_x
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Orient {
     Up,
@@ -604,6 +632,11 @@ impl eframe::App for App {
                             if ui.add_enabled(can_ops, egui::Button::new("目標配置")).clicked() {
                                 if !self.cp_place_targeted() {
                                     self.push_log("目標に寄与する置き方が見つかりませんでした".into());
+                                }
+                            }
+                            if ui.add_enabled(can_ops, egui::Button::new("目標盤面生成")).clicked() {
+                                if !self.cp_generate_target_board() {
+                                    self.push_log("条件を満たす目標盤面が見つかりませんでした".into());
                                 }
                             }
                             if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("戻る")).clicked() {
@@ -865,6 +898,186 @@ impl App {
         true
     }
 
+    fn cp_generate_target_board(&mut self) -> bool {
+        if self.cp.lock || self.cp.anim.is_some() {
+            return false;
+        }
+
+        let original_target = self.cp.target;
+        let base_cols = self.cp.cols;
+        let pair = self.cp_current_pair();
+
+        let mut rectangles: Vec<(usize, usize)> = Vec::new();
+        for h in 1..=9 {
+            if 9 % h != 0 {
+                continue;
+            }
+            let w = 9 / h;
+            if w == 0 || w > W || h > H {
+                continue;
+            }
+            rectangles.push((w, h));
+        }
+        rectangles.sort_by(|a, b| {
+            let diff_a = if a.0 > a.1 { a.0 - a.1 } else { a.1 - a.0 };
+            let diff_b = if b.0 > b.1 { b.0 - b.1 } else { b.1 - b.0 };
+            diff_a
+                .cmp(&diff_b)
+                .then_with(|| a.0.max(a.1).cmp(&b.0.max(b.1)))
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        let mut overall_best: Option<AutoTargetCandidate> = None;
+
+        for (width, height) in rectangles {
+            let mut best_for_size: Option<AutoTargetCandidate> = None;
+            if width > W || height > H {
+                continue;
+            }
+            for origin_x in 0..=W - width {
+                for base_y in 0..=H - height {
+                    // 条件③: 各列の最下段が外枠 or 既存ぷよに隣接
+                    let mut supported = true;
+                    for dx in 0..width {
+                        let x = origin_x + dx;
+                        if base_y == 0 {
+                            continue;
+                        }
+                        if self.cp_board_color(x, base_y - 1).is_none() {
+                            supported = false;
+                            break;
+                        }
+                    }
+                    if !supported {
+                        continue;
+                    }
+
+                    let mut cells: Vec<(usize, usize, Option<u8>)> =
+                        Vec::with_capacity(width * height);
+                    for dx in 0..width {
+                        for dy in 0..height {
+                            let x = origin_x + dx;
+                            let y = base_y + dy;
+                            let fixed = self.cp_board_color(x, y);
+                            cells.push((x, y, fixed));
+                        }
+                    }
+
+                    let mut mapping: Vec<Option<usize>> = Vec::with_capacity(cells.len());
+                    let mut free_count: usize = 0;
+                    for (_, _, fixed) in &cells {
+                        if fixed.is_some() {
+                            mapping.push(None);
+                        } else {
+                            mapping.push(Some(free_count));
+                            free_count += 1;
+                        }
+                    }
+
+                    let mut evaluate_candidate = |assignment: &[u8]| {
+                        let mut board = base_cols;
+                        let mut target = [[0u16; W]; 4];
+                        let mut valid = true;
+
+                        for (idx, &(x, y, fixed)) in cells.iter().enumerate() {
+                            let color_u8 = match fixed {
+                                Some(c) => c,
+                                None => {
+                                    let assign_idx = mapping[idx].expect("free cell index");
+                                    assignment[assign_idx]
+                                }
+                            };
+                            let color = (color_u8 as usize).min(3);
+                            let bit = 1u16 << y;
+
+                            for c in 0..4 {
+                                if c != color && (board[c][x] & bit) != 0 {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if !valid {
+                                break;
+                            }
+
+                            for c in 0..4 {
+                                board[c][x] &= !bit;
+                            }
+                            board[color][x] |= bit;
+                            target[color][x] |= bit;
+                        }
+
+                        if !valid {
+                            return;
+                        }
+
+                        let chains = simulate_chain_length(board);
+                        if chains == 0 {
+                            return;
+                        }
+
+                        let saved_target = self.cp.target;
+                        self.cp.target = target;
+                        let result = self.cp_choose_target_move(pair).and_then(|(mx, orient)| {
+                            self.cp_move_positions(mx, orient, pair)
+                                .and_then(|positions| {
+                                    self.cp_score_target_positions(&positions)
+                                        .map(|(score, matches)| (score, matches))
+                                })
+                        });
+                        self.cp.target = saved_target;
+
+                        let Some((score, matches)) = result else {
+                            return;
+                        };
+
+                        let candidate = AutoTargetCandidate {
+                            target,
+                            chains,
+                            matches,
+                            score,
+                            base_y,
+                            origin_x,
+                        };
+
+                        if best_for_size
+                            .as_ref()
+                            .map_or(true, |best| candidate.better_than(best))
+                        {
+                            best_for_size = Some(candidate);
+                        }
+                    };
+
+                    if free_count == 0 {
+                        evaluate_candidate(&[]);
+                    } else {
+                        enumerate_color_assignments(free_count, |assignment| {
+                            evaluate_candidate(assignment);
+                        });
+                    }
+                }
+            }
+
+            if let Some(best) = best_for_size {
+                overall_best = Some(best);
+                break;
+            }
+        }
+
+        if let Some(best) = overall_best {
+            self.cp.target = best.target;
+            self.push_log(format!(
+                "目標盤面を自動生成しました（{}連鎖 / 一致{}マス）",
+                best.chains, best.matches
+            ));
+            true
+        } else {
+            self.cp.target = original_target;
+            false
+        }
+    }
+
     fn cp_place_with(&mut self, x: usize, orient: Orient, pair: (u8, u8)) {
         // 盤面に2つの色を追加（重力後の最下段に直接置く）
         match orient {
@@ -911,6 +1124,19 @@ impl App {
         let bit = 1u16 << y;
         let c = (color as usize).min(3);
         self.cp.cols[c][x] |= bit;
+    }
+
+    fn cp_board_color(&self, x: usize, y: usize) -> Option<u8> {
+        if x >= W || y >= H {
+            return None;
+        }
+        let bit = 1u16 << y;
+        for c in 0..4 {
+            if self.cp.cols[c][x] & bit != 0 {
+                return Some(c as u8);
+            }
+        }
+        None
     }
 
     fn cp_check_and_start_chain(&mut self) {
@@ -1149,6 +1375,40 @@ impl App {
         };
         self.cp_set_target_color(x, y, next);
     }
+}
+
+fn enumerate_color_assignments<F: FnMut(&[u8])>(free_count: usize, mut callback: F) {
+    fn rec<F: FnMut(&[u8])>(idx: usize, assign: &mut [u8], callback: &mut F) {
+        if idx == assign.len() {
+            callback(&*assign);
+            return;
+        }
+        for color in 0..4u8 {
+            assign[idx] = color;
+            rec(idx + 1, assign, callback);
+        }
+    }
+
+    if free_count == 0 {
+        callback(&[]);
+        return;
+    }
+
+    let mut assign = vec![0u8; free_count];
+    rec(0, &mut assign, &mut callback);
+}
+
+fn simulate_chain_length(mut cols: [[u16; W]; 4]) -> u32 {
+    let mut chains = 0;
+    loop {
+        let (cleared, next) = apply_erase_and_fall_cols(&cols);
+        if !cleared {
+            break;
+        }
+        chains += 1;
+        cols = next;
+    }
+    chains
 }
 
 // ===== App ユーティリティ =====
