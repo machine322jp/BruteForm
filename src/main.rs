@@ -1034,7 +1034,8 @@ impl App {
         if self.cp.lock || self.cp.anim.is_some() {
             return;
         }
-        match brute_force_generate_chain_extensions() {
+        let (result, stats) = brute_force_generate_chain_extensions();
+        match result {
             Some(res) => {
                 self.cp.generated_base = res.base;
                 self.cp.generated_head = res.head;
@@ -1046,6 +1047,31 @@ impl App {
                 self.cp.generated_back = None;
             }
         }
+        self.push_log(format!(
+            "総当たりデバッグ: 盤面候補 {} 件 (2連鎖 {} 件) / 頭候補 {} 件 / 後ろ候補 {} 件",
+            stats.base_board_candidates,
+            stats.base_two_chain,
+            stats.head_blocks_considered,
+            stats.back_blocks_considered,
+        ));
+        self.push_log(format!(
+            "テンプレ展開: lookup {} (hit {} / miss {} / 実計算 {}) / 展開盤面 {} (最大 {}) / キャッシュ最大 {} 件",
+            stats.template_cache_lookups,
+            stats.template_cache_hits,
+            stats.template_cache_misses,
+            stats.template_evaluations,
+            stats.template_board_evaluations,
+            stats.max_template_board_evaluations,
+            stats.cache_size_peak,
+        ));
+        self.push_log(format!(
+            "経過時間: 総計 {} / 落下シミュ {} / 頭分析 {} / 後ろ分析 {} / テンプレ列挙 {}",
+            fmt_dur_ms(stats.total_elapsed),
+            fmt_dur_ms(stats.simulation_elapsed),
+            fmt_dur_ms(stats.head_analysis_elapsed),
+            fmt_dur_ms(stats.back_analysis_elapsed),
+            fmt_dur_ms(stats.template_evaluation_elapsed),
+        ));
     }
 
     fn cp_apply_generated(&mut self, chain: &GeneratedChain) {
@@ -2126,27 +2152,43 @@ where
 
 type TemplateCache = HashMap<Vec<Cell>, Option<GeneratedChain>>;
 
-fn max_chain_for_template(template: &[Cell], cache: &mut TemplateCache) -> Option<GeneratedChain> {
+fn max_chain_for_template(
+    template: &[Cell],
+    cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
+) -> Option<GeneratedChain> {
     let key: Vec<Cell> = template.to_vec();
+    stats.template_cache_lookups += 1;
     if let Some(cached) = cache.get(&key) {
+        stats.template_cache_hits += 1;
         return cached.clone();
     }
+    stats.template_cache_misses += 1;
 
     let mut best_chain = 0u32;
     let mut best_board: Option<[[u16; W]; 4]> = None;
+    let mut boards_enumerated = 0u64;
+    let eval_start = Instant::now();
     enumerate_boards_from_template(template, |cols| {
+        boards_enumerated += 1;
         let (chains, _) = simulate_chain_steps(*cols, false);
         if chains > best_chain || best_board.is_none() {
             best_chain = chains;
             best_board = Some(*cols);
         }
     });
+    stats.template_board_evaluations += boards_enumerated;
+    stats.max_template_board_evaluations =
+        stats.max_template_board_evaluations.max(boards_enumerated);
+    stats.template_evaluation_elapsed += eval_start.elapsed();
+    stats.template_evaluations += 1;
 
     let result = best_board.map(|board| GeneratedChain {
         board,
         chains: best_chain,
     });
     cache.insert(key, result.clone());
+    stats.cache_size_peak = stats.cache_size_peak.max(cache.len());
     result
 }
 
@@ -2212,23 +2254,26 @@ fn analyze_head_extension(
     base: &[[u16; W]; 4],
     first_mask: &[u16; W],
     cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
 ) -> Option<GeneratedChain> {
     let base_cells = cells_from_cols(base);
     let mut best_board: Option<[[u16; W]; 4]> = None;
     let mut best_chain = 0u32;
+    let call_start = Instant::now();
     for x in 0..W {
         let mut bits = first_mask[x];
         while bits != 0 {
             let y = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             for block in head_blocks_for_cell(x, y) {
+                stats.head_blocks_considered += 1;
                 let mut template = base_cells.clone();
                 for &(bx, by) in &block {
                     if bx < W && by < H {
                         template[by * W + bx] = Cell::Any;
                     }
                 }
-                if let Some(res) = max_chain_for_template(&template, cache) {
+                if let Some(res) = max_chain_for_template(&template, cache, stats) {
                     if res.chains > best_chain || best_board.is_none() {
                         best_chain = res.chains;
                         best_board = Some(res.board);
@@ -2237,6 +2282,7 @@ fn analyze_head_extension(
             }
         }
     }
+    stats.head_analysis_elapsed += call_start.elapsed();
     best_board.map(|board| GeneratedChain {
         board,
         chains: best_chain,
@@ -2247,6 +2293,7 @@ fn analyze_back_extension(
     base: &[[u16; W]; 4],
     second_mask: &[u16; W],
     cache: &mut TemplateCache,
+    stats: &mut GenerationDebugStats,
 ) -> Option<GeneratedChain> {
     let base_cells = cells_from_cols(base);
     let mut min_x = W;
@@ -2270,6 +2317,7 @@ fn analyze_back_extension(
     if max_x != min_x {
         candidates.push(max_x);
     }
+    let call_start = Instant::now();
     for x in candidates {
         if x >= W || second_mask[x] == 0 {
             continue;
@@ -2285,13 +2333,14 @@ fn analyze_back_extension(
             continue;
         };
         for block in back_blocks_for_column(x, y_top) {
+            stats.back_blocks_considered += 1;
             let mut template = base_cells.clone();
             for &(bx, by) in &block {
                 if bx < W && by < H {
                     template[by * W + bx] = Cell::Any;
                 }
             }
-            if let Some(res) = max_chain_for_template(&template, cache) {
+            if let Some(res) = max_chain_for_template(&template, cache, stats) {
                 if res.chains > best_chain || best_board.is_none() {
                     best_chain = res.chains;
                     best_board = Some(res.board);
@@ -2299,10 +2348,31 @@ fn analyze_back_extension(
             }
         }
     }
+    stats.back_analysis_elapsed += call_start.elapsed();
     best_board.map(|board| GeneratedChain {
         board,
         chains: best_chain,
     })
+}
+
+#[derive(Default, Clone, Debug)]
+struct GenerationDebugStats {
+    total_elapsed: Duration,
+    simulation_elapsed: Duration,
+    head_analysis_elapsed: Duration,
+    back_analysis_elapsed: Duration,
+    template_evaluation_elapsed: Duration,
+    base_board_candidates: u64,
+    base_two_chain: u64,
+    head_blocks_considered: u64,
+    back_blocks_considered: u64,
+    template_cache_lookups: u64,
+    template_cache_hits: u64,
+    template_cache_misses: u64,
+    template_evaluations: u64,
+    template_board_evaluations: u64,
+    max_template_board_evaluations: u64,
+    cache_size_peak: usize,
 }
 
 struct BruteForceGenerationResult {
@@ -2311,7 +2381,10 @@ struct BruteForceGenerationResult {
     back: Option<GeneratedChain>,
 }
 
-fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult> {
+fn brute_force_generate_chain_extensions(
+) -> (Option<BruteForceGenerationResult>, GenerationDebugStats) {
+    let mut stats = GenerationDebugStats::default();
+    let overall_start = Instant::now();
     let mut template = vec![Cell::Blank; W * H];
     for x in 0..3 {
         for y in 0..3 {
@@ -2325,10 +2398,14 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
     let mut cache: TemplateCache = HashMap::new();
 
     enumerate_boards_from_template(&template, |cols| {
+        stats.base_board_candidates += 1;
+        let sim_start = Instant::now();
         let (chains, masks) = simulate_chain_steps(*cols, false);
+        stats.simulation_elapsed += sim_start.elapsed();
         if chains != 2 || masks.len() < 2 {
             return;
         }
+        stats.base_two_chain += 1;
         let base = GeneratedChain {
             board: *cols,
             chains,
@@ -2336,7 +2413,9 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
         if first_base.is_none() {
             first_base = Some(base.clone());
         }
-        if let Some(head) = analyze_head_extension(cols, &masks[0], &mut cache) {
+        if let Some(head) =
+            analyze_head_extension(cols, &masks[0], &mut cache, &mut stats)
+        {
             let update = match &best_head {
                 Some((_, current)) => head.chains > current.chains,
                 None => true,
@@ -2345,7 +2424,9 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
                 best_head = Some((base.clone(), head));
             }
         }
-        if let Some(back) = analyze_back_extension(cols, &masks[1], &mut cache) {
+        if let Some(back) =
+            analyze_back_extension(cols, &masks[1], &mut cache, &mut stats)
+        {
             let update = match &best_back {
                 Some((_, current)) => back.chains > current.chains,
                 None => true,
@@ -2356,8 +2437,10 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
         }
     });
 
+    stats.total_elapsed = overall_start.elapsed();
+
     if first_base.is_none() && best_head.is_none() && best_back.is_none() {
-        return None;
+        return (None, stats);
     }
 
     let base = best_head
@@ -2369,7 +2452,10 @@ fn brute_force_generate_chain_extensions() -> Option<BruteForceGenerationResult>
     let head = best_head.map(|(_, h)| h);
     let back = best_back.map(|(_, b)| b);
 
-    Some(BruteForceGenerationResult { base, head, back })
+    (
+        Some(BruteForceGenerationResult { base, head, back }),
+        stats,
+    )
 }
 
 // 列 x への 4色一括代入（ループ展開）
