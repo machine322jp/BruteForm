@@ -1,5 +1,3 @@
-
-
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -12,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use dashmap::{DashMap, DashSet};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2};
 use num_bigint::BigUint;
-use num_traits::{One, Zero, ToPrimitive};
+use num_traits::{One, ToPrimitive, Zero};
+use rand::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
-use dashmap::{DashMap, DashSet};
-use rand::Rng;
 
 // u64 キー専用のノーハッシュ（高速化）
 use nohash_hasher::BuildNoHashHasher;
@@ -35,10 +33,10 @@ const MASK14: u16 = (1u16 << H) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cell {
-    Blank,   // '.'
-    Any,     // 'N' (空白 or 色)
-    Any4,    // 'X' (色のみ)
-    Abs(u8), // 0..12 = 'A'..'M'
+    Blank,     // '.'
+    Any,       // 'N' (空白 or 色)
+    Any4,      // 'X' (色のみ)
+    Abs(u8),   // 0..12 = 'A'..'M'
     Fixed(u8), // 0..=3 = '0'..'3' (RGBY固定)
 }
 
@@ -87,8 +85,8 @@ struct DfsDepthTimes {
     // 葉専用
     leaf_fall_pre: Duration,
     leaf_hash: Duration,
-    leaf_memo_get: Duration,           // 今回の最適化後はほぼ0のまま
-    leaf_memo_miss_compute: Duration,  // 到達判定（reaches_t...）
+    leaf_memo_get: Duration,          // 今回の最適化後はほぼ0のまま
+    leaf_memo_miss_compute: Duration, // 到達判定（reaches_t...）
     out_serialize: Duration,
 }
 #[derive(Default, Clone, Copy)]
@@ -98,9 +96,9 @@ struct DfsDepthCounts {
     pruned_upper: u64,
     leaves: u64,
     // 葉早期リターン（落下や到達判定より前）
-    leaf_pre_tshort: u64,          // 4T 未満で不可能
-    leaf_pre_e1_impossible: u64,   // E1 不可能（4連結なし）
-    memo_lhit: u64, // 以降は基本0（残しつつ非使用）
+    leaf_pre_tshort: u64,        // 4T 未満で不可能
+    leaf_pre_e1_impossible: u64, // E1 不可能（4連結なし）
+    memo_lhit: u64,              // 以降は基本0（残しつつ非使用）
     memo_ghit: u64,
     memo_miss: u64,
 }
@@ -348,6 +346,7 @@ struct ChainPlay {
     // アニメ表示用：消去直後の盤面と、落下後の次盤面
     erased_cols: Option<[[u16; W]; 4]>,
     next_cols: Option<[[u16; W]; 4]>,
+    plan: Option<ChainPlan>,
 }
 
 impl Default for ChainPlay {
@@ -358,7 +357,10 @@ impl Default for ChainPlay {
             seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
         }
         let cols = [[0u16; W]; 4];
-        let s0 = SavedState { cols, pair_index: 0 };
+        let s0 = SavedState {
+            cols,
+            pair_index: 0,
+        };
         Self {
             cols,
             pair_seq: seq,
@@ -368,12 +370,41 @@ impl Default for ChainPlay {
             lock: false,
             erased_cols: None,
             next_cols: None,
+            plan: None,
         }
     }
 }
 
+#[derive(Clone)]
+struct ChainPlan {
+    base_board: [[u16; W]; 4],
+    base_chain_len: u32,
+    head: Option<ExtensionPlan>,
+    tail: Option<ExtensionPlan>,
+}
+
+#[derive(Clone, Copy)]
+enum ExtensionKind {
+    Head,
+    TailLeft,
+    TailRight,
+}
+
+#[derive(Clone)]
+struct ExtensionPlan {
+    kind: ExtensionKind,
+    max_chain: u32,
+    pair_board: [[u16; W]; 4],
+    target_board: Vec<Cell>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Orient { Up, Right, Down, Left }
+enum Orient {
+    Up,
+    Right,
+    Down,
+    Left,
+}
 
 fn install_japanese_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
@@ -400,7 +431,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
         let path = fontdir.join(name);
         if let Ok(bytes) = std::fs::read(&path) {
             let key = format!("jp-{}", name.to_lowercase());
-            fonts.font_data.insert(key.clone(), FontData::from_owned(bytes));
+            fonts
+                .font_data
+                .insert(key.clone(), FontData::from_owned(bytes));
             fonts
                 .families
                 .get_mut(&FontFamily::Proportional)
@@ -419,7 +452,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
     if loaded {
         ctx.set_fonts(fonts);
     } else {
-        eprintln!("日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。");
+        eprintln!(
+            "日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。"
+        );
     }
 }
 
@@ -589,6 +624,9 @@ impl eframe::App for App {
                             if ui.add_enabled(can_ops, egui::Button::new("ランダム配置")).clicked() {
                                 self.cp_place_random();
                             }
+                            if ui.add_enabled(can_ops, egui::Button::new("自動生成（総当たり）")).clicked() {
+                                self.cp_generate_plan();
+                            }
                             if ui.add_enabled(can_ops && self.cp.undo_stack.len() > 1, egui::Button::new("戻る")).clicked() {
                                 self.cp_undo();
                             }
@@ -674,49 +712,94 @@ impl eframe::App for App {
 
         // 盤面側もスクロール可能に
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                if self.mode == Mode::BruteForce {
-                    ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
-                    ui.add_space(6.0);
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if self.mode == Mode::BruteForce {
+                        ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
+                        ui.add_space(6.0);
 
-                    let cell_size = Vec2::new(28.0, 28.0);
-                    let gap = 2.0;
+                        let cell_size = Vec2::new(28.0, 28.0);
+                        let gap = 2.0;
 
-                    let shift_pressed = ui.input(|i| i.modifiers.shift);
-                    for y in (0..H).rev() {
-                        ui.horizontal(|ui| {
-                            for x in 0..W {
-                                let i = y * W + x;
-                                let (text, fill, stroke) = cell_style(self.board[i]);
-                                let btn = egui::Button::new(RichText::new(text).size(12.0))
-                                    .min_size(cell_size)
-                                    .fill(fill)
-                                    .stroke(stroke);
-                                let resp = ui.add(btn);
-                                if resp.clicked_by(egui::PointerButton::Primary) {
-                                    if shift_pressed {
-                                        self.board[i] = cycle_fixed(self.board[i]);
-                                    } else {
-                                        self.board[i] = cycle_abs(self.board[i]);
+                        let shift_pressed = ui.input(|i| i.modifiers.shift);
+                        for y in (0..H).rev() {
+                            ui.horizontal(|ui| {
+                                for x in 0..W {
+                                    let i = y * W + x;
+                                    let (text, fill, stroke) = cell_style(self.board[i]);
+                                    let btn = egui::Button::new(RichText::new(text).size(12.0))
+                                        .min_size(cell_size)
+                                        .fill(fill)
+                                        .stroke(stroke);
+                                    let resp = ui.add(btn);
+                                    if resp.clicked_by(egui::PointerButton::Primary) {
+                                        if shift_pressed {
+                                            self.board[i] = cycle_fixed(self.board[i]);
+                                        } else {
+                                            self.board[i] = cycle_abs(self.board[i]);
+                                        }
                                     }
+                                    if resp.clicked_by(egui::PointerButton::Middle) {
+                                        self.board[i] = cycle_any(self.board[i]);
+                                    }
+                                    if resp.clicked_by(egui::PointerButton::Secondary) {
+                                        self.board[i] = Cell::Blank;
+                                    }
+                                    ui.add_space(gap);
                                 }
-                                if resp.clicked_by(egui::PointerButton::Middle) {
-                                    self.board[i] = cycle_any(self.board[i]);
-                                }
-                                if resp.clicked_by(egui::PointerButton::Secondary) {
-                                    self.board[i] = Cell::Blank;
-                                }
-                                ui.add_space(gap);
+                            });
+                            ui.add_space(gap);
+                        }
+                    } else {
+                        ui.label("連鎖生成 — 盤面");
+                        ui.add_space(6.0);
+                        draw_preview(ui, &self.cp.cols);
+                        if let Some(plan) = &self.cp.plan {
+                            ui.add_space(12.0);
+                            ui.label(format!("基本形: {} 連鎖", plan.base_chain_len));
+                            ui.add_space(6.0);
+                            if let Some(head) = &plan.head {
+                                ui.group(|ui| {
+                                    ui.label(format!("頭伸ばし: 最大 {} 連鎖", head.max_chain));
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label("現在手プレビュー");
+                                            draw_preview(ui, &head.pair_board);
+                                        });
+                                        ui.add_space(12.0);
+                                        ui.vertical(|ui| {
+                                            ui.label("目標盤面");
+                                            draw_cell_board(ui, &head.target_board);
+                                        });
+                                    });
+                                });
+                                ui.add_space(8.0);
                             }
-                        });
-                        ui.add_space(gap);
+                            if let Some(tail) = &plan.tail {
+                                ui.group(|ui| {
+                                    let label = match tail.kind {
+                                        ExtensionKind::TailLeft => "後ろ伸ばし (左)",
+                                        ExtensionKind::TailRight => "後ろ伸ばし (右)",
+                                        ExtensionKind::Head => "後ろ伸ばし",
+                                    };
+                                    ui.label(format!("{}: 最大 {} 連鎖", label, tail.max_chain));
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label("現在手プレビュー");
+                                            draw_preview(ui, &tail.pair_board);
+                                        });
+                                        ui.add_space(12.0);
+                                        ui.vertical(|ui| {
+                                            ui.label("目標盤面");
+                                            draw_cell_board(ui, &tail.target_board);
+                                        });
+                                    });
+                                });
+                            }
+                        }
                     }
-                } else {
-                    ui.label("連鎖生成 — 盤面");
-                    ui.add_space(6.0);
-                    draw_preview(ui, &self.cp.cols);
-                }
-            });
+                });
         });
 
         ctx.request_repaint_after(Duration::from_millis(16));
@@ -744,6 +827,7 @@ impl App {
             self.cp.anim = None;
             self.cp.erased_cols = None;
             self.cp.next_cols = None;
+            self.cp.plan = None;
             if let Some(prev) = self.cp.undo_stack.pop() {
                 let _ = prev; // pop current snapshot
             }
@@ -755,10 +839,13 @@ impl App {
     }
 
     fn cp_reset_to_initial(&mut self) {
-        if self.cp.lock { return; }
+        if self.cp.lock {
+            return;
+        }
         self.cp.anim = None;
         self.cp.erased_cols = None;
         self.cp.next_cols = None;
+        self.cp.plan = None;
         if let Some(first) = self.cp.undo_stack.first().copied() {
             self.cp.cols = first.cols;
             self.cp.pair_index = first.pair_index;
@@ -770,9 +857,15 @@ impl App {
     }
 
     fn cp_place_random(&mut self) {
-        if self.cp.lock || self.cp.anim.is_some() { return; }
+        if self.cp.lock || self.cp.anim.is_some() {
+            return;
+        }
         // 事前スナップショット
-        self.cp.undo_stack.push(SavedState { cols: self.cp.cols, pair_index: self.cp.pair_index });
+        self.cp.undo_stack.push(SavedState {
+            cols: self.cp.cols,
+            pair_index: self.cp.pair_index,
+        });
+        self.cp.plan = None;
 
         let pair = self.cp_current_pair();
         let mut rng = rand::thread_rng();
@@ -782,18 +875,25 @@ impl App {
         for x in 0..W {
             // 垂直（Up/Down）: 同一列に2個置けるか
             let h = self.cp_col_height(x);
-            if h + 1 < H { moves.push((x, Orient::Up)); moves.push((x, Orient::Down)); }
+            if h + 1 < H {
+                moves.push((x, Orient::Up));
+                moves.push((x, Orient::Down));
+            }
             // 右
             if x + 1 < W {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x + 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Right)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Right));
+                }
             }
             // 左
             if x >= 1 {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x - 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Left)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Left));
+                }
             }
         }
         if moves.is_empty() {
@@ -810,6 +910,7 @@ impl App {
     }
 
     fn cp_place_with(&mut self, x: usize, orient: Orient, pair: (u8, u8)) {
+        self.cp.plan = None;
         // 盤面に2つの色を追加（重力後の最下段に直接置く）
         match orient {
             Orient::Up => {
@@ -842,12 +943,16 @@ impl App {
     }
 
     fn cp_col_height(&self, x: usize) -> usize {
-        let occ = (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x]) & MASK14;
+        let occ =
+            (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x])
+                & MASK14;
         occ.count_ones() as usize
     }
 
     fn cp_set_cell(&mut self, x: usize, y: usize, color: u8) {
-        if x >= W || y >= H { return; }
+        if x >= W || y >= H {
+            return;
+        }
         let bit = 1u16 << y;
         let c = (color as usize).min(3);
         self.cp.cols[c][x] |= bit;
@@ -869,19 +974,29 @@ impl App {
         self.cp.erased_cols = Some(erased);
         self.cp.next_cols = Some(next);
         self.cp.cols = erased; // 消えた状態を表示
-        self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+        self.cp.anim = Some(AnimState {
+            phase: AnimPhase::AfterErase,
+            since: Instant::now(),
+        });
     }
 
     fn cp_step_animation(&mut self) {
-        let Some(anim) = self.cp.anim else { return; };
+        let Some(anim) = self.cp.anim else {
+            return;
+        };
         let elapsed = anim.since.elapsed();
-        if elapsed < Duration::from_millis(500) { return; }
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
         match anim.phase {
             AnimPhase::AfterErase => {
                 if let Some(next) = self.cp.next_cols.take() {
                     self.cp.cols = next;
                 }
-                self.cp.anim = Some(AnimState { phase: AnimPhase::AfterFall, since: Instant::now() });
+                self.cp.anim = Some(AnimState {
+                    phase: AnimPhase::AfterFall,
+                    since: Instant::now(),
+                });
                 // 次の消去準備は AfterFall 経由
             }
             AnimPhase::AfterFall => {
@@ -900,8 +1015,34 @@ impl App {
                     self.cp.cols = erased;
                     self.cp.erased_cols = Some(erased);
                     self.cp.next_cols = Some(next);
-                    self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+                    self.cp.anim = Some(AnimState {
+                        phase: AnimPhase::AfterErase,
+                        since: Instant::now(),
+                    });
                 }
+            }
+        }
+    }
+
+    fn cp_generate_plan(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() {
+            return;
+        }
+        let pair = self.cp_current_pair();
+        match auto_generate_plan(pair) {
+            Some(plan) => {
+                let base_chain = plan.base_chain_len;
+                self.cp.cols = plan.base_board;
+                self.cp.plan = Some(plan);
+                self.cp.undo_stack.clear();
+                self.cp.undo_stack.push(SavedState {
+                    cols: self.cp.cols,
+                    pair_index: self.cp.pair_index,
+                });
+                self.push_log(format!("自動生成完了: 基本形 {base_chain} 連鎖"));
+            }
+            None => {
+                self.push_log("自動生成に失敗しました".into());
             }
         }
     }
@@ -972,7 +1113,9 @@ impl App {
 }
 
 fn has_profile_any(p: &ProfileTotals) -> bool {
-    if p.io_write_total != Duration::ZERO { return true; }
+    if p.io_write_total != Duration::ZERO {
+        return true;
+    }
     for i in 0..=W {
         let t = p.dfs_times[i];
         if t.gen_candidates != Duration::ZERO
@@ -983,13 +1126,22 @@ fn has_profile_any(p: &ProfileTotals) -> bool {
             || t.leaf_memo_get != Duration::ZERO
             || t.leaf_memo_miss_compute != Duration::ZERO
             || t.out_serialize != Duration::ZERO
-        { return true; }
+        {
+            return true;
+        }
         let c = p.dfs_counts[i];
-        if c.nodes != 0 || c.cand_generated != 0 || c.pruned_upper != 0
+        if c.nodes != 0
+            || c.cand_generated != 0
+            || c.pruned_upper != 0
             || c.leaves != 0
             || c.leaf_pre_tshort != 0
             || c.leaf_pre_e1_impossible != 0
-            || c.memo_lhit != 0 || c.memo_ghit != 0 || c.memo_miss != 0 { return true; }
+            || c.memo_lhit != 0
+            || c.memo_ghit != 0
+            || c.memo_miss != 0
+        {
+            return true;
+        }
     }
     false
 }
@@ -1004,53 +1156,60 @@ fn fmt_dur_ms(d: Duration) -> String {
 }
 
 fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
-    ui.monospace(format!("I/O 書き込み合計: {}", fmt_dur_ms(p.io_write_total)));
+    ui.monospace(format!(
+        "I/O 書き込み合計: {}",
+        fmt_dur_ms(p.io_write_total)
+    ));
     ui.add_space(4.0);
-    egui::Grid::new("profile-grid").striped(true).num_columns(16).show(ui, |ui| {
-        ui.monospace("深さ");
-        ui.monospace("nodes");
-        ui.monospace("cand");
-        ui.monospace("pruned");
-        ui.monospace("leaves");
-        ui.monospace("pre_thres");
-        ui.monospace("pre_e1ng");
-        ui.monospace("L-hit");
-        ui.monospace("G-hit");
-        ui.monospace("Miss");
-        ui.monospace("gen");
-        ui.monospace("assign");
-        ui.monospace("upper");
-        ui.monospace("fall");
-        ui.monospace("hash");
-        ui.monospace("memo_get/miss_compute/out");
-        ui.end_row();
-
-        for d in 0..=W {
-            let c = p.dfs_counts[d];
-            let t = p.dfs_times[d];
-            ui.monospace(format!("{:>2}", d));
-            ui.monospace(format!("{}", c.nodes));
-            ui.monospace(format!("{}", c.cand_generated));
-            ui.monospace(format!("{}", c.pruned_upper));
-            ui.monospace(format!("{}", c.leaves));
-            ui.monospace(format!("{}", c.leaf_pre_tshort));
-            ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
-            ui.monospace(format!("{}", c.memo_lhit));
-            ui.monospace(format!("{}", c.memo_ghit));
-            ui.monospace(format!("{}", c.memo_miss));
-            ui.monospace(fmt_dur_ms(t.gen_candidates));
-            ui.monospace(fmt_dur_ms(t.assign_cols));
-            ui.monospace(fmt_dur_ms(t.upper_bound));
-            ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
-            ui.monospace(fmt_dur_ms(t.leaf_hash));
-            ui.monospace(format!("{} / {} / {}",
-                fmt_dur_ms(t.leaf_memo_get),
-                fmt_dur_ms(t.leaf_memo_miss_compute),
-                fmt_dur_ms(t.out_serialize),
-            ));
+    egui::Grid::new("profile-grid")
+        .striped(true)
+        .num_columns(16)
+        .show(ui, |ui| {
+            ui.monospace("深さ");
+            ui.monospace("nodes");
+            ui.monospace("cand");
+            ui.monospace("pruned");
+            ui.monospace("leaves");
+            ui.monospace("pre_thres");
+            ui.monospace("pre_e1ng");
+            ui.monospace("L-hit");
+            ui.monospace("G-hit");
+            ui.monospace("Miss");
+            ui.monospace("gen");
+            ui.monospace("assign");
+            ui.monospace("upper");
+            ui.monospace("fall");
+            ui.monospace("hash");
+            ui.monospace("memo_get/miss_compute/out");
             ui.end_row();
-        }
-    });
+
+            for d in 0..=W {
+                let c = p.dfs_counts[d];
+                let t = p.dfs_times[d];
+                ui.monospace(format!("{:>2}", d));
+                ui.monospace(format!("{}", c.nodes));
+                ui.monospace(format!("{}", c.cand_generated));
+                ui.monospace(format!("{}", c.pruned_upper));
+                ui.monospace(format!("{}", c.leaves));
+                ui.monospace(format!("{}", c.leaf_pre_tshort));
+                ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
+                ui.monospace(format!("{}", c.memo_lhit));
+                ui.monospace(format!("{}", c.memo_ghit));
+                ui.monospace(format!("{}", c.memo_miss));
+                ui.monospace(fmt_dur_ms(t.gen_candidates));
+                ui.monospace(fmt_dur_ms(t.assign_cols));
+                ui.monospace(fmt_dur_ms(t.upper_bound));
+                ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
+                ui.monospace(fmt_dur_ms(t.leaf_hash));
+                ui.monospace(format!(
+                    "{} / {} / {}",
+                    fmt_dur_ms(t.leaf_memo_get),
+                    fmt_dur_ms(t.leaf_memo_miss_compute),
+                    fmt_dur_ms(t.out_serialize),
+                ));
+                ui.end_row();
+            }
+        });
 }
 
 #[derive(Clone, Copy)]
@@ -1158,16 +1317,15 @@ fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
     let width = W as f32 * cell + (W - 1) as f32 * gap;
     let height = H as f32 * cell + (H - 1) as f32 * gap;
 
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     // 0=R, 1=G, 2=B, 3=Y
     let palette = [
-        Color32::from_rgb(239, 68, 68),   // red
-        Color32::from_rgb(34, 197, 94),   // green
-        Color32::from_rgb(59, 130, 246),  // blue
-        Color32::from_rgb(234, 179, 8),   // yellow
+        Color32::from_rgb(239, 68, 68),  // red
+        Color32::from_rgb(34, 197, 94),  // green
+        Color32::from_rgb(59, 130, 246), // blue
+        Color32::from_rgb(234, 179, 8),  // yellow
     ];
 
     for y in 0..H {
@@ -1192,6 +1350,377 @@ fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
             painter.rect_filled(r, 3.0, fill);
         }
     }
+}
+
+fn draw_cell_board(ui: &mut egui::Ui, cells: &[Cell]) {
+    let cell_size = Vec2::new(18.0, 18.0);
+    let gap = 1.0;
+    for y in (0..H).rev() {
+        ui.horizontal(|ui| {
+            for x in 0..W {
+                let idx = y * W + x;
+                let (text, fill, stroke) =
+                    cell_style(cells.get(idx).copied().unwrap_or(Cell::Blank));
+                let btn = egui::Button::new(RichText::new(text).size(11.0))
+                    .min_size(cell_size)
+                    .fill(fill)
+                    .stroke(stroke);
+                ui.add_enabled(false, btn);
+                ui.add_space(gap);
+            }
+        });
+        ui.add_space(gap);
+    }
+}
+
+fn auto_generate_plan(pair: (u8, u8)) -> Option<ChainPlan> {
+    let mut best_base: Option<([[u16; W]; 4], u32, [u16; W], [u16; W])> = None;
+    let mut best_score: i64 = i64::MIN;
+
+    for x0 in 0..=W - 3 {
+        let mut positions = Vec::with_capacity(9);
+        for dy in 0..3 {
+            for dx in 0..3 {
+                positions.push((x0 + dx, dy));
+            }
+        }
+        let mut assign = vec![0u8; positions.len()];
+        enumerate_square_assignments(0, &mut assign, &positions, &mut best_base, &mut best_score);
+    }
+
+    if let Some((board, chain_len, first_clear, second_clear)) = best_base {
+        let head = build_head_plan(board, first_clear, pair);
+        let tail = build_tail_plan(board, second_clear);
+        Some(ChainPlan {
+            base_board: board,
+            base_chain_len: chain_len,
+            head,
+            tail,
+        })
+    } else {
+        None
+    }
+}
+
+fn enumerate_square_assignments(
+    idx: usize,
+    assign: &mut [u8],
+    positions: &[(usize, usize)],
+    best_base: &mut Option<([[u16; W]; 4], u32, [u16; W], [u16; W])>,
+    best_score: &mut i64,
+) {
+    if idx >= assign.len() {
+        evaluate_square_assignment(assign, positions, best_base, best_score);
+        return;
+    }
+    for color in 0..4u8 {
+        assign[idx] = color;
+        enumerate_square_assignments(idx + 1, assign, positions, best_base, best_score);
+    }
+}
+
+fn evaluate_square_assignment(
+    assign: &[u8],
+    positions: &[(usize, usize)],
+    best_base: &mut Option<([[u16; W]; 4], u32, [u16; W], [u16; W])>,
+    best_score: &mut i64,
+) {
+    let mut board = [[0u16; W]; 4];
+    for (i, &(x, y)) in positions.iter().enumerate() {
+        let color = assign[i] as usize;
+        board[color][x] |= 1u16 << y;
+    }
+    let board = fall_cols_fast(&board);
+    let (chain_len, clears) = simulate_chain(board);
+    if chain_len < 2 {
+        return;
+    }
+    let first_clear = clears.get(0).copied().unwrap_or([0u16; W]);
+    let second_clear = clears.get(1).copied().unwrap_or([0u16; W]);
+
+    let score = (chain_len as i64) * 100
+        + first_clear
+            .iter()
+            .map(|m| m.count_ones() as i64)
+            .sum::<i64>()
+        + second_clear
+            .iter()
+            .map(|m| m.count_ones() as i64)
+            .sum::<i64>();
+
+    if score > *best_score {
+        *best_score = score;
+        *best_base = Some((board, chain_len, first_clear, second_clear));
+    }
+}
+
+fn simulate_chain(mut board: [[u16; W]; 4]) -> (u32, Vec<[u16; W]>) {
+    let mut clears: Vec<[u16; W]> = Vec::new();
+    loop {
+        let clear = compute_erase_mask_cols(&board);
+        if clear.iter().all(|&c| c == 0) {
+            break;
+        }
+        clears.push(clear);
+        board = apply_given_clear_and_fall(&board, clears.last().unwrap());
+    }
+    (clears.len() as u32, clears)
+}
+
+fn build_head_plan(
+    board: [[u16; W]; 4],
+    first_clear: [u16; W],
+    pair: (u8, u8),
+) -> Option<ExtensionPlan> {
+    let target = select_head_cell(&first_clear)?;
+    if target.1 + 1 >= H {
+        return None;
+    }
+
+    let mut base = board;
+    clear_cell(&mut base, target);
+    clear_cell(&mut base, (target.0, target.1 + 1));
+
+    let region = build_head_region(target);
+    if region.is_empty() {
+        return None;
+    }
+
+    let mut pair_board = base;
+    if !cell_empty(&pair_board, target) || !cell_empty(&pair_board, (target.0, target.1 + 1)) {
+        return None;
+    }
+    pair_board[pair.0 as usize][target.0] |= 1u16 << target.1;
+    pair_board[pair.1 as usize][target.0] |= 1u16 << (target.1 + 1);
+
+    let mut region_base = base;
+    clear_region(&mut region_base, &region);
+    let max_chain = region_max_chain(&region_base, &region)?;
+    let target_board = build_target_board_from(&region_base, &region);
+
+    Some(ExtensionPlan {
+        kind: ExtensionKind::Head,
+        max_chain,
+        pair_board,
+        target_board,
+    })
+}
+
+fn build_tail_plan(board: [[u16; W]; 4], second_clear: [u16; W]) -> Option<ExtensionPlan> {
+    let mut columns: Vec<(usize, usize)> = Vec::new();
+    for x in 0..W {
+        let mask = second_clear[x];
+        if mask == 0 {
+            continue;
+        }
+        if let Some(top_y) = top_most_bit(mask) {
+            columns.push((x, top_y));
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<(usize, usize, ExtensionKind)> = Vec::new();
+    if let Some(&(x, y)) = columns.iter().min_by_key(|(x, _)| *x) {
+        candidates.push((x, y, ExtensionKind::TailLeft));
+    }
+    if let Some(&(x, y)) = columns.iter().max_by_key(|(x, _)| *x) {
+        if candidates.iter().all(|&(cx, _, _)| cx != x) {
+            candidates.push((x, y, ExtensionKind::TailRight));
+        }
+    }
+
+    let mut best: Option<ExtensionPlan> = None;
+    let mut best_chain: u32 = 0;
+
+    for (x, top_y, kind) in candidates {
+        let anchor_y = top_y + 1;
+        if anchor_y >= H {
+            continue;
+        }
+        let direction = match kind {
+            ExtensionKind::TailLeft => -1,
+            ExtensionKind::TailRight => 1,
+            ExtensionKind::Head => 1,
+        };
+        let region = build_tail_region((x, anchor_y), direction);
+        if region.is_empty() {
+            continue;
+        }
+
+        let mut region_base = board;
+        clear_region(&mut region_base, &region);
+        let pair_board = region_base;
+        if let Some(max_chain) = region_max_chain(&pair_board, &region) {
+            if max_chain > best_chain {
+                let target_board = build_target_board_from(&pair_board, &region);
+                best_chain = max_chain;
+                best = Some(ExtensionPlan {
+                    kind,
+                    max_chain,
+                    pair_board,
+                    target_board,
+                });
+            }
+        }
+    }
+
+    best
+}
+
+fn top_most_bit(mask: u16) -> Option<usize> {
+    for y in (0..H).rev() {
+        if (mask & (1u16 << y)) != 0 {
+            return Some(y);
+        }
+    }
+    None
+}
+
+fn cell_empty(board: &[[u16; W]; 4], pos: (usize, usize)) -> bool {
+    if pos.0 >= W || pos.1 >= H {
+        return false;
+    }
+    (board[0][pos.0] | board[1][pos.0] | board[2][pos.0] | board[3][pos.0]) & (1u16 << pos.1) == 0
+}
+
+fn clear_cell(board: &mut [[u16; W]; 4], pos: (usize, usize)) {
+    if pos.0 >= W || pos.1 >= H {
+        return;
+    }
+    let bit = 1u16 << pos.1;
+    for color in 0..4 {
+        board[color][pos.0] &= !bit;
+    }
+}
+
+fn clear_region(board: &mut [[u16; W]; 4], region: &[(usize, usize)]) {
+    for &(x, y) in region {
+        clear_cell(board, (x, y));
+    }
+}
+
+fn region_max_chain(base: &[[u16; W]; 4], region: &[(usize, usize)]) -> Option<u32> {
+    if region.is_empty() {
+        return None;
+    }
+    let mut best_len: u32 = 0;
+    let mut assign = vec![0u8; region.len()];
+
+    fn dfs(
+        idx: usize,
+        assign: &mut [u8],
+        region: &[(usize, usize)],
+        base: &[[u16; W]; 4],
+        best_len: &mut u32,
+    ) {
+        if idx >= assign.len() {
+            let mut board = *base;
+            for (i, &(x, y)) in region.iter().enumerate() {
+                let color = assign[i] as usize;
+                board[color][x] |= 1u16 << y;
+            }
+            let board = fall_cols_fast(&board);
+            let (len, _) = simulate_chain(board);
+            if len > *best_len {
+                *best_len = len;
+            }
+            return;
+        }
+        for color in 0..4u8 {
+            assign[idx] = color;
+            dfs(idx + 1, assign, region, base, best_len);
+        }
+    }
+
+    dfs(0, &mut assign, region, base, &mut best_len);
+
+    Some(best_len)
+}
+
+fn build_target_board_from(base: &[[u16; W]; 4], region: &[(usize, usize)]) -> Vec<Cell> {
+    let mut cells = vec![Cell::Blank; W * H];
+    for x in 0..W {
+        for y in 0..H {
+            let idx = y * W + x;
+            let mut cell = Cell::Blank;
+            for color in 0..4 {
+                if (base[color][x] & (1u16 << y)) != 0 {
+                    cell = Cell::Fixed(color as u8);
+                }
+            }
+            cells[idx] = cell;
+        }
+    }
+    for &(x, y) in region {
+        if x < W && y < H {
+            cells[y * W + x] = Cell::Any;
+        }
+    }
+    cells
+}
+
+fn build_head_region(target: (usize, usize)) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    for dy in 0..3 {
+        for dx in -1..=1 {
+            let nx = target.0 as i32 + dx;
+            let ny = target.1 as i32 + dy;
+            if nx >= 0 && nx < W as i32 && ny >= 0 && ny < H as i32 {
+                cells.push((nx as usize, ny as usize));
+            }
+        }
+    }
+    cells.sort();
+    cells.dedup();
+    cells.sort_by_key(|&(x, y)| {
+        let dx = (x as i32 - target.0 as i32).abs();
+        let dy = y as i32 - target.1 as i32;
+        (dy, dx)
+    });
+    if cells.len() > 8 {
+        cells.truncate(8);
+    }
+    cells
+}
+
+fn build_tail_region(anchor: (usize, usize), direction: i32) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    for dx in 0..4 {
+        for dy in 0..2 {
+            let nx = anchor.0 as i32 + direction * dx as i32;
+            let ny = anchor.1 as i32 - dy as i32;
+            if nx >= 0 && nx < W as i32 && ny >= 0 && ny < H as i32 {
+                cells.push((nx as usize, ny as usize));
+            }
+        }
+    }
+    cells.sort();
+    cells.dedup();
+    if cells.len() > 8 {
+        cells.truncate(8);
+    }
+    cells
+}
+
+fn select_head_cell(first_clear: &[u16; W]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for x in 0..W {
+        for y in 0..H {
+            if (first_clear[x] & (1u16 << y)) != 0 {
+                match best {
+                    None => best = Some((x, y)),
+                    Some((bx, by)) => {
+                        if y > by || (y == by && x < bx) {
+                            best = Some((x, y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 // ======== ここから：ビットボード最適化版 ========
@@ -1356,7 +1885,9 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         let mut best_sat = -1i32;
         let mut best_deg = -1i32;
         for v in 0..color.len() {
-            if color[v] != 4 { continue; }
+            if color[v] != 4 {
+                continue;
+            }
             let sat = used_mask[v].count_ones() as i32;
             let deg = adj[v].count_ones() as i32;
             if sat > best_sat || (sat == best_sat && deg > best_deg) {
@@ -1370,9 +1901,13 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         // 使える色を列挙（4色から used を除く）+ 対称性破り
         let forbid = used_mask[v];
         let mut new_color_limit = (max_used + 1).min(3);
-        if vleft == total_n { new_color_limit = 0; } // 最初の1手は 0 のみ
+        if vleft == total_n {
+            new_color_limit = 0;
+        } // 最初の1手は 0 のみ
         for c in 0u8..=new_color_limit {
-            if ((forbid >> c) & 1) != 0 { continue; }
+            if ((forbid >> c) & 1) != 0 {
+                continue;
+            }
             color[v] = c;
 
             // 近傍の used_mask を更新
@@ -1387,7 +1922,15 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
                 }
             }
             let next_max_used = if c > max_used { c } else { max_used };
-            dfs(vleft - 1, total_n, adj, color, used_mask, out, next_max_used);
+            dfs(
+                vleft - 1,
+                total_n,
+                adj,
+                color,
+                used_mask,
+                out,
+                next_max_used,
+            );
 
             // ロールバック
             color[v] = 4;
@@ -1557,7 +2100,15 @@ fn stream_column_candidates_timed<F: FnMut([u16; 4])>(
     }
     let mut masks = [0u16; 4];
     let mut last_start = Instant::now();
-    rec(0, false, col, &mut masks, enum_time, &mut last_start, &mut yield_masks);
+    rec(
+        0,
+        false,
+        col,
+        &mut masks,
+        enum_time,
+        &mut last_start,
+        &mut yield_masks,
+    );
     *enum_time += last_start.elapsed();
 }
 
@@ -1614,7 +2165,9 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("bmi2") {
-            unsafe { return fall_cols_bmi2(cols_in); }
+            unsafe {
+                return fall_cols_bmi2(cols_in);
+            }
         }
     }
     fall_cols(cols_in)
@@ -1623,10 +2176,10 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn fall_cols_bmi2(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_pdep_u32, _pext_u32};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{_pdep_u32, _pext_u32};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_pdep_u32, _pext_u32};
 
     let mut out = [[0u16; W]; 4];
 
@@ -1875,7 +2428,9 @@ fn reaches_t_from_pre_single_e1(pre: &[[u16; W]; 4], t: u32, exact_four_only: bo
         let mut clr: BB = 0;
         let mut tot: u32 = 0;
         for &bb in bb_pre.iter() {
-            if bb.count_ones() < 4 { continue; }
+            if bb.count_ones() < 4 {
+                continue;
+            }
             let mut s = bb;
             while s != 0 {
                 let seed = s & (!s + 1);
@@ -2165,7 +2720,11 @@ fn canonical_hash64_fast(cols: &[[u16; W]; 4]) -> (u64, bool) {
     } else {
         let h0 = canonical_hash64_oriented_bits(cols, false);
         let h1 = canonical_hash64_oriented_bits(cols, true);
-        if h0 <= h1 { (h0, false) } else { (h1, true) }
+        if h0 <= h1 {
+            (h0, false)
+        } else {
+            (h1, true)
+        }
     }
 }
 
@@ -2342,10 +2901,8 @@ struct ApproxLru {
 impl ApproxLru {
     fn new(limit: usize) -> Self {
         let cap = (limit.saturating_mul(11) / 10).max(16);
-        let map: U64Map<bool> = std::collections::HashMap::with_capacity_and_hasher(
-            cap,
-            BuildNoHashHasher::default(),
-        );
+        let map: U64Map<bool> =
+            std::collections::HashMap::with_capacity_and_hasher(cap, BuildNoHashHasher::default());
         let q = VecDeque::with_capacity(cap);
         Self { limit, map, q }
     }
@@ -2457,9 +3014,11 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].memo_miss += 1;
         }
         *mmiss_batch += 1;
-        let reached = prof!(profile_enabled, time_batch.dfs_times[depth].leaf_memo_miss_compute, {
+        let reached = prof!(
+            profile_enabled,
+            time_batch.dfs_times[depth].leaf_memo_miss_compute,
             reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only)
-        });
+        );
         if !reached {
             // 統計フラッシュ（従来通り）
             if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
@@ -2530,12 +3089,23 @@ fn dfs_combine_parallel(
                 }
 
                 // 出力整形
-                let line = prof!(profile_enabled, time_batch.dfs_times[depth].out_serialize, {
-                    let key_str = encode_canonical_string(&pre, mirror);
-                    let hash = fnv1a32(&key_str);
-                    let rows = serialize_board_from_cols(&pre);
-                    make_json_line_str(&key_str, hash, threshold, &rows, map_label_to_color, mirror)
-                });
+                let line = prof!(
+                    profile_enabled,
+                    time_batch.dfs_times[depth].out_serialize,
+                    {
+                        let key_str = encode_canonical_string(&pre, mirror);
+                        let hash = fnv1a32(&key_str);
+                        let rows = serialize_board_from_cols(&pre);
+                        make_json_line_str(
+                            &key_str,
+                            hash,
+                            threshold,
+                            &rows,
+                            map_label_to_color,
+                            mirror,
+                        )
+                    }
+                );
                 batch.push(line);
                 *outputs_batch += 1;
 
@@ -2594,9 +3164,23 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].pruned_upper += 1;
         }
         if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-            && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+            && (*nodes_batch > 0
+                || *leaves_batch > 0
+                || *outputs_batch > 0
+                || *pruned_batch > 0
+                || *lhit_batch > 0
+                || *ghit_batch > 0
+                || *mmiss_batch > 0)
         {
-            let _ = stat_sender.send(StatDelta { nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch, pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch });
+            let _ = stat_sender.send(StatDelta {
+                nodes: *nodes_batch,
+                leaves: *leaves_batch,
+                outputs: *outputs_batch,
+                pruned: *pruned_batch,
+                lhit: *lhit_batch,
+                ghit: *ghit_batch,
+                mmiss: *mmiss_batch,
+            });
             *nodes_batch = 0;
             *leaves_batch = 0;
             *outputs_batch = 0;
@@ -2798,7 +3382,8 @@ fn run_search(
         let bmi2 = std::is_x86_feature_detected!("bmi2");
         let popcnt = std::is_x86_feature_detected!("popcnt");
         let _ = tx.send(Message::Log(format!(
-            "CPU features: bmi2={} / popcnt={}", bmi2, popcnt
+            "CPU features: bmi2={} / popcnt={}",
+            bmi2, popcnt
         )));
     }
 
@@ -2879,9 +3464,11 @@ fn run_search(
     let tx_progress = tx.clone();
     let total_clone = total.clone();
     let abort_for_agg = abort.clone();
-    let global_output_once: Arc<DU64Set> = Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
+    let global_output_once: Arc<DU64Set> =
+        Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
     // グローバル memo は get を廃止（挿入もしない方針）
-    let global_memo: Arc<DU64Map<bool>> = Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
+    let global_memo: Arc<DU64Map<bool>> =
+        Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
 
     let global_memo_for_agg = global_memo.clone();
     let lru_limit_for_agg = lru_limit;
@@ -2991,10 +3578,8 @@ fn run_search(
     });
 
     // metas を並列探索
-    metas
-        .par_iter()
-        .enumerate()
-        .try_for_each(|(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
+    metas.par_iter().enumerate().try_for_each(
+        |(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
             if abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -3019,10 +3604,15 @@ fn run_search(
                 first_candidates
                     .par_iter()
                     .try_for_each(|masks| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         let mut cols0 = [[0u16; W]; 4];
-                        for c in 0..4 { cols0[c][first_x] = masks[c]; }
-                        let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                        for c in 0..4 {
+                            cols0[c][first_x] = masks[c];
+                        }
+                        let mut memo =
+                            ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                         let mut local_output_once: U64Set = U64Set::default();
                         let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3072,9 +3662,26 @@ fn run_search(
                             &remain_suffix,
                         );
 
-                        if !batch.is_empty() { let _ = wtx.send(batch); }
-                        if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                            let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                        if !batch.is_empty() {
+                            let _ = wtx.send(batch);
+                        }
+                        if nodes_batch > 0
+                            || leaves_batch > 0
+                            || outputs_batch > 0
+                            || pruned_batch > 0
+                            || lhit_batch > 0
+                            || ghit_batch > 0
+                            || mmiss_batch > 0
+                        {
+                            let _ = stx.send(StatDelta {
+                                nodes: nodes_batch,
+                                leaves: leaves_batch,
+                                outputs: outputs_batch,
+                                pruned: pruned_batch,
+                                lhit: lhit_batch,
+                                ghit: ghit_batch,
+                                mmiss: mmiss_batch,
+                            });
                         }
                         if profile_enabled && time_delta_has_any(&time_batch) {
                             let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3094,16 +3701,21 @@ fn run_search(
                 second_candidates
                     .par_iter()
                     .try_for_each(|m2| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         for masks in &first_candidates {
-                            if abort.load(Ordering::Relaxed) { break; }
+                            if abort.load(Ordering::Relaxed) {
+                                break;
+                            }
 
                             let mut cols0 = [[0u16; W]; 4];
                             for c in 0..4 {
                                 cols0[c][first_x] = masks[c];
                                 cols0[c][second_x] = m2[c];
                             }
-                            let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                            let mut memo =
+                                ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                             let mut local_output_once: U64Set = U64Set::default();
                             let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3118,7 +3730,9 @@ fn run_search(
 
                             let mut time_batch = TimeDelta::default();
 
-                            let placed2: u32 = (0..4).map(|c| masks[c].count_ones() + m2[c].count_ones()).sum();
+                            let placed2: u32 = (0..4)
+                                .map(|c| masks[c].count_ones() + m2[c].count_ones())
+                                .sum();
                             let _ = dfs_combine_parallel(
                                 2,
                                 &mut cols0,
@@ -3153,9 +3767,26 @@ fn run_search(
                                 &remain_suffix,
                             );
 
-                            if !batch.is_empty() { let _ = wtx.send(batch); }
-                            if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                                let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                            if !batch.is_empty() {
+                                let _ = wtx.send(batch);
+                            }
+                            if nodes_batch > 0
+                                || leaves_batch > 0
+                                || outputs_batch > 0
+                                || pruned_batch > 0
+                                || lhit_batch > 0
+                                || ghit_batch > 0
+                                || mmiss_batch > 0
+                            {
+                                let _ = stx.send(StatDelta {
+                                    nodes: nodes_batch,
+                                    leaves: leaves_batch,
+                                    outputs: outputs_batch,
+                                    pruned: pruned_batch,
+                                    lhit: lhit_batch,
+                                    ghit: ghit_batch,
+                                    mmiss: mmiss_batch,
+                                });
                             }
                             if profile_enabled && time_delta_has_any(&time_batch) {
                                 let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3165,11 +3796,14 @@ fn run_search(
                     })?;
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     drop(wtx);
     drop(stx);
-    let writer_result = writer_handle.join().map_err(|_| anyhow!("writer join error"))?;
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer join error"))?;
     writer_result?;
     agg_handle.join().map_err(|_| anyhow!("agg join error"))?;
 
@@ -3179,8 +3813,7 @@ fn run_search(
 // ユーティリティ：配列初期化（const generics）
 fn array_init<T, F: FnMut(usize) -> T, const N: usize>(mut f: F) -> [T; N] {
     use std::mem::MaybeUninit;
-    let mut data: [MaybeUninit<T>; N] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+    let mut data: [MaybeUninit<T>; N] = unsafe { MaybeUninit::uninit().assume_init() };
     for (i, slot) in data.iter_mut().enumerate() {
         slot.write(f(i));
     }
