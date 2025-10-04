@@ -1,7 +1,15 @@
 [package]
-name = "puyo_gui"
+name = "rust_bruteforce"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "rust_bruteforce"
+path = "src/lib.rs"
+
+[[bin]]
+name = "puyo_gui"
+path = "src/main.rs"
 
 [dependencies]
 # エラー処理

@@ -2552,25 +2552,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
-name = "puyo_gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "dashmap",
- "eframe",
- "egui",
- "nohash-hasher",
- "num-bigint",
- "num-traits",
- "rand",
- "rayon",
- "rfd",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2730,6 +2711,25 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "rust_bruteforce"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "dashmap",
+ "eframe",
+ "egui",
+ "nohash-hasher",
+ "num-bigint",
+ "num-traits",
+ "rand",
+ "rayon",
+ "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
