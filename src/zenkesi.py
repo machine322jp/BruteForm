@@ -73,6 +73,11 @@ class PlacementLogger:
     def skip(self, reason):
         self.entries.append(f"      SKIP: {reason}")
 
+    # ↓ placed() は使わず、check_and_place 内でインライン化します
+    #def placed(self, idx, x, y, color):
+    #    c = color_to_letter((color, 0))
+    #    self.entries.append(f"    B#{idx}: 列 {x} 行 {y} に色 {c} を配置")
+
     def dump(self):
         print("\n".join(self.entries))
         self.entries.clear()
@@ -81,22 +86,13 @@ class PlacementLogger:
 class FieldUtils:
     @staticmethod
     def apply_gravity(field, columns, rows):
-        """
-        最上段(y=0)は固定して動かさない。
-        y=1..rows-1 のみ重力適用（= 下から13段目は落下可能、最上段は落下しない）。
-        """
         for x in range(columns):
-            top_fixed = field[0][x]  # 最上段は保持
-            stack = [field[y][x] for y in reversed(range(1, rows)) if field[y][x] is not None]
-            for y in reversed(range(1, rows)):
+            stack = [field[y][x] for y in reversed(range(rows)) if field[y][x] is not None]
+            for y in reversed(range(rows)):
                 field[y][x] = stack.pop(0) if stack else None
-            field[0][x] = top_fixed
 
     @staticmethod
     def get_connected_cells(field, x, y, columns, rows, directions):
-        # 下から14段目(最上段:y=0)と13段目(y=1)は連結に参加しない
-        if y <= 1:
-            return [(x, y)]
         base_color = get_cell_color(field[y][x])
         visited = [[False] * columns for _ in range(rows)]
         visited[y][x] = True
@@ -106,10 +102,9 @@ class FieldUtils:
             cx, cy = queue.popleft()
             for dx, dy in directions:
                 nx, ny = cx + dx, cy + dy
-                # 連結探索は y>=2 のみ対象
-                if (0 <= nx < columns and 2 <= ny < rows and
-                        not visited[ny][nx] and
-                        field[ny][nx] is not None and
+                if (0 <= nx < columns and 0 <= ny < rows and 
+                        not visited[ny][nx] and 
+                        field[ny][nx] is not None and 
                         get_cell_color(field[ny][nx]) == base_color):
                     visited[ny][nx] = True
                     queue.append((nx, ny))
@@ -174,8 +169,7 @@ class 連鎖検出器:
         adjacent_groups = []
         for dx, dy in [(1, 0), (-1, 0), (0, 1)]:
             nx, ny = x + dx, y + dy
-            # ★ y>=2 のみ隣接同色の対象
-            if self._is_in_range(nx, ny) and ny >= 2 and self.field[ny][nx] is not None and get_cell_color(self.field[ny][nx]) == base_color:
+            if self._is_in_range(nx, ny) and self.field[ny][nx] is not None and get_cell_color(self.field[ny][nx]) == base_color:
                 group = self._get_connected_cells(nx, ny)
                 if not any(set(group) & set(existing) for existing in adjacent_groups):
                     adjacent_groups.append(group)
@@ -329,7 +323,7 @@ class 連鎖検出器:
     def _find_4_or_more(self):
         visited = [[False] * self.columns for _ in range(self.rows)]
         found_groups = []
-        for y in range(2, self.rows):  # ★ y=2(下から12段目)以降のみ探索
+        for y in range(self.rows):
             for x in range(self.columns):
                 if self.field[y][x] is None or visited[y][x]:
                     continue
@@ -358,6 +352,7 @@ class 連鎖生成器:
         for x in range(self.columns):
             if blocked_columns and x in blocked_columns:
                 continue
+            
             if preferred_columns and x in preferred_columns:
                 continue
             candidate_columns.append(x)
@@ -603,7 +598,7 @@ def restore_state():
 def find_4plus_groups():
     visited = [[False]*COLUMNS for _ in range(ROWS)]
     result = []
-    for y in range(2, ROWS):  # ★ y=2(=下から12段目)以降のみ探索
+    for y in range(ROWS):
         for x in range(COLUMNS):
             if field[y][x] is None or visited[y][x]:
                 continue
@@ -615,7 +610,7 @@ def find_4plus_groups():
                 cx, cy = q.popleft()
                 for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                     nx, ny = cx + dx, cy + dy
-                    if 0 <= nx < COLUMNS and 2 <= ny < ROWS and not visited[ny][nx] and field[ny][nx] is not None and get_cell_color(field[ny][nx]) == base_color:
+                    if 0 <= nx < COLUMNS and 0 <= ny < ROWS and not visited[ny][nx] and field[ny][nx] is not None and get_cell_color(field[ny][nx]) == base_color:
                         visited[ny][nx] = True
                         q.append((nx, ny))
                         group.append((nx, ny))
@@ -962,7 +957,6 @@ while True:
                 update_right_side_preview()
 
     if current_pair.axis.fixed and current_pair.child.fixed:
-        # 既存のゲームオーバー条件（出現位置の詰まり）
         if field[1][2] is not None or field[0][2] is not None:
             print("Game Over!")
             pygame.quit()
@@ -995,13 +989,6 @@ while True:
             pygame.display.flip()
             pygame.time.delay(300)
             groups = find_4plus_groups()
-
-        # ★ 連鎖・重力の解決後に「左から3列目×下から12段目」が埋まっていたらゲームオーバー
-        # 左から3列目 → x=2, 下から12段目 → y=2
-        if field[2][2] is not None:
-            print("Game Over!（左から3列目の12段目が埋まっています）")
-            pygame.quit()
-            sys.exit()
 
         current_pair = next_pair
         next_pair = double_next_pair

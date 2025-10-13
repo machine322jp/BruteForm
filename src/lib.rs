@@ -5,6 +5,7 @@ pub mod model;
 pub mod profiling;
 pub mod search;
 pub mod app;
+pub mod chain;
 
 // 外部クレートの再エクスポート
 pub use anyhow::{Result, anyhow, Context};

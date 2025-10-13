@@ -44,6 +44,15 @@ pub struct ChainPlay {
     pub erased_cols: Option<[[u16; W]; 4]>,
     pub next_cols: Option<[[u16; W]; 4]>,
     pub target_board: [[u16; W]; 4],
+    // 追撃最適化（ビーム探索）パラメータ
+    pub beam_width: usize,
+    pub max_depth: usize,
+    // 連鎖検出結果
+    pub target_chain_info: Option<Vec<crate::chain::ChainStep>>,
+    // 周囲9マスのキャッシュ（1連鎖目と最終連鎖用）
+    pub around_cells_cache: Option<(std::collections::HashSet<(usize, usize)>, std::collections::HashSet<(usize, usize)>)>,
+    // 削除したフリートップの位置（頭伸ばし用）
+    pub removed_freetop: Option<(usize, usize)>,
 }
 
 impl Default for ChainPlay {
@@ -65,6 +74,11 @@ impl Default for ChainPlay {
             erased_cols: None,
             next_cols: None,
             target_board: [[0u16; W]; 4],
+            beam_width: 10,
+            max_depth: 8,
+            target_chain_info: None,
+            around_cells_cache: None,
+            removed_freetop: None,
         }
     }
 }
