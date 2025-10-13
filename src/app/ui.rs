@@ -15,6 +15,7 @@ use crate::app::chain_play::{ChainPlay, SavedState, AnimState, AnimPhase, Orient
 use crate::profiling::{ProfileTotals, has_profile_any, fmt_dur_ms};
 use crate::search::run_search;
 use crate::search::board::{apply_clear_no_fall, apply_erase_and_fall_cols};
+use crate::vlog;
 
 /// ペアプレビューの描画
 fn draw_pair_preview(ui: &mut egui::Ui, pair: (u8, u8)) {
@@ -369,24 +370,45 @@ impl App {
                 .flat_map(|group| group.iter().copied())
                 .collect();
         
-        // 各列のフリートップを特定（連鎖マスの中で最も高いy座標）
-        let mut freetops = std::collections::HashMap::new();
+        // 各列の1連鎖目ぷよの最上部を取得
+        let mut col_max_y = std::collections::HashMap::new();
         for &(x, y) in &first_chain_cells {
-            freetops.entry(x)
+            col_max_y.entry(x)
                 .and_modify(|max_y| { if y > *max_y { *max_y = y; } })
                 .or_insert(y);
         }
         
-        // フリートップが複数ある場合は左から選ぶ
-        if freetops.is_empty() {
-            self.push_log("1連鎖目にフリートップがありません".into());
+        // 盤面を取得して、その上にぷよがないかチェック
+        let board = crate::chain::cols_to_board(&self.cp.target_board);
+        
+        // フリートップ列（1連鎖目の最上部の上にぷよがない列）を特定
+        let mut freetop_cols: Vec<(usize, usize)> = Vec::new();
+        for (&x, &max_y) in col_max_y.iter() {
+            // この列の最上部の上にぷよがあるかチェック
+            let mut has_puyo_above = false;
+            for y in (max_y + 1)..crate::constants::H {
+                if board[y][x].is_some() {
+                    has_puyo_above = true;
+                    break;
+                }
+            }
+            
+            // 上にぷよがない = フリートップ列
+            if !has_puyo_above {
+                freetop_cols.push((x, max_y));
+            }
+        }
+        
+        if freetop_cols.is_empty() {
+            self.push_log("1連鎖目にフリートップ列がありません（全ての列で上にぷよが乗っています）".into());
             return;
         }
         
-        let mut cols: Vec<_> = freetops.keys().copied().collect();
-        cols.sort();
-        let remove_col = cols[0];
-        let remove_y = freetops[&remove_col];
+        // フリートップ列を左から選ぶ
+        freetop_cols.sort_by_key(|&(x, _)| x);
+        let (remove_col, remove_y) = freetop_cols[0];
+        
+        vlog!("[フリートップ削除] 候補: {:?}, 選択: ({}, {})", freetop_cols, remove_col, remove_y);
         
         // 目標盤面から該当マスを削除
         let bit = 1u16 << remove_y;
@@ -470,7 +492,7 @@ impl App {
             first_chain_top: &std::collections::HashMap<usize, usize>,
         ) {
             if *trial_count == 0 && idx == 0 {
-                println!("  [dfs] 初回呼び出し: idx={}, candidates.len()={}", idx, candidates.len());
+                vlog!("  [dfs] 初回呼び出し: idx={}, candidates.len()={}", idx, candidates.len());
             }
             
             if idx == candidates.len() {
@@ -601,15 +623,15 @@ impl App {
                 
                 // デバッグ：全ての結果をログ出力（最初の10件のみ）
                 if *trial_count <= 10 {
-                    println!("  [総当たり] trial={}, placed={:?}, chain={} (baseline={})", 
+                    vlog!("  [総当たり] trial={}, placed={:?}, chain={} (baseline={})", 
                              trial_count, placed, chain, baseline);
                 } else if *trial_count % 10000 == 0 {
-                    println!("  [総当たり] 試行中... {} / ? 件", trial_count);
+                    vlog!("  [総当たり] 試行中... {} / ? 件", trial_count);
                 }
                 
                 // デバッグ：baseline以上（=含む）の結果を最初の5件表示
                 if chain >= baseline && results.len() < 5 {
-                    println!("  [総当たり] ★baseline以上: trial={}, chain={}, placed={:?}", 
+                    vlog!("  [総当たり] ★baseline以上: trial={}, chain={}, placed={:?}", 
                              trial_count, chain, placed);
                 }
                 
@@ -644,12 +666,12 @@ impl App {
             }
         }
         
-        println!("  [総当たり] dfs開始: candidates.len()={}", candidates.len());
+        vlog!("  [総当たり] dfs開始: candidates.len()={}", candidates.len());
         
         let mut placed = Vec::new();
         dfs(base_board, candidates, 0, &mut placed, &mut results, baseline, max_results, &mut trial_count, first_chain_top);
         
-        println!("  [総当たり] dfs完了: 試行数={}, ベースライン超え={} 件", trial_count, results.len());
+        vlog!("  [総当たり] dfs完了: 試行数={}, ベースライン超え={} 件", trial_count, results.len());
         
         results
     }
@@ -678,7 +700,7 @@ impl App {
         let mut baseline_detector = crate::chain::Detector::new(base_board.clone());
         let baseline_after_remove = baseline_detector.simulate_chain() as i32;
         
-        println!("[頭伸ばし] 削除前の連鎖数={}, 削除後の連鎖数={}", 
+        vlog!("[頭伸ばし] 削除前の連鎖数={}, 削除後の連鎖数={}", 
                  baseline_before_remove, baseline_after_remove);
         
         // 目標は削除前の連鎖数を超えること
@@ -698,7 +720,7 @@ impl App {
             first_chain_top.entry(x).and_modify(|max_y| *max_y = (*max_y).max(y)).or_insert(y);
         }
         
-        println!("[頭伸ばし] 削除前の1連鎖目の列と最上部={:?}", {
+        vlog!("[頭伸ばし] 削除前の1連鎖目の列と最上部={:?}", {
             let mut v: Vec<_> = first_chain_top.iter().map(|(x, y)| (*x, *y)).collect();
             v.sort_unstable();
             v
@@ -727,7 +749,7 @@ impl App {
             candidate_positions.insert((rx, ry + 1));
         }
         
-        println!("[頭伸ばし] 削除前周囲マス数={}, 削除マス含む候補位置数={}", 
+        vlog!("[頭伸ばし] 削除前周囲マス数={}, 削除マス含む候補位置数={}", 
                  around_first_before_remove.len(), candidate_positions.len());
         
         // 候補列を収集
@@ -736,12 +758,12 @@ impl App {
             cand_cols.insert(x);
         }
         
-        println!("[頭伸ばし] 候補位置数={} 候補列={:?}", candidate_positions.len(), {
+        vlog!("[頭伸ばし] 候補位置数={} 候補列={:?}", candidate_positions.len(), {
             let mut v: Vec<_> = cand_cols.iter().copied().collect();
             v.sort_unstable();
             v
         });
-        println!("[頭伸ばし] 削除マス=({}, {})", rx, ry);
+        vlog!("[頭伸ばし] 削除マス=({}, {})", rx, ry);
         
         self.push_log(format!(
             "頭伸ばし開始: ベースライン={}連鎖, 候補位置={}個, 候補列数={}",
@@ -752,11 +774,11 @@ impl App {
         let mut cand_positions: Vec<(usize, usize)> = candidate_positions.iter().copied().collect();
         cand_positions.sort();
         
-        println!("[頭伸ばし] 候補位置={:?}", cand_positions);
+        vlog!("[頭伸ばし] 候補位置={:?}", cand_positions);
         
         // 完全総当たり：各位置に4色または空欄を配置（5^N通り）
         let total_combinations = 5usize.pow(cand_positions.len() as u32);
-        println!("[頭伸ばし] 総当たり開始: {}^{} = {} 通り（空欄含む）", 5, cand_positions.len(), total_combinations);
+        vlog!("[頭伸ばし] 総当たり開始: {}^{} = {} 通り（空欄含む）", 5, cand_positions.len(), total_combinations);
         
         let max_results = if total_combinations > 1_000_000 {
             self.push_log(format!(
@@ -787,19 +809,19 @@ impl App {
         all_results.sort_by(|a, b| b.0.cmp(&a.0));
         let results = all_results;
         
-        println!("[頭伸ばし] find_best_arrangement: results={} 件", results.len());
+        vlog!("[頭伸ばし] find_best_arrangement: results={} 件", results.len());
         
         // 結果の詳細をログ出力（最初の10件）
         for (i, (ch, _, seed)) in results.iter().enumerate().take(10) {
-            println!("[頭伸ばし] result[{}]: chain={}, seed={:?}", i, ch, seed);
+            vlog!("[頭伸ばし] result[{}]: chain={}, seed={:?}", i, ch, seed);
         }
         
         // 連鎖が伸びる最良案を採用
         let mut adopted: Option<(i32, crate::chain::Board)> = None;
         for (ch, board_pre, seed) in results {
-            println!("[頭伸ばし] 候補確認: chain={} vs baseline={} seed={:?}", ch, baseline, seed);
+            vlog!("[頭伸ばし] 候補確認: chain={} vs baseline={} seed={:?}", ch, baseline, seed);
             if ch > baseline {
-                println!("[頭伸ばし] 採用: chain={} > baseline={} seed={:?}", ch, baseline, seed);
+                vlog!("[頭伸ばし] 採用: chain={} > baseline={} seed={:?}", ch, baseline, seed);
                 adopted = Some((ch, board_pre));
                 break;
             }
@@ -807,13 +829,27 @@ impl App {
         
         if let Some((best_chain, board_pre)) = adopted {
             let new_cols = crate::chain::board_to_cols(&board_pre);
+            
+            // 更新前のハッシュを計算（デバッグ用）
+            let old_hash: u64 = self.cp.target_board.iter()
+                .flat_map(|color_col| color_col.iter())
+                .fold(0u64, |acc, &val| acc.wrapping_mul(31).wrapping_add(val as u64));
+            
             self.cp.target_board = new_cols;
+            
+            // 更新後のハッシュを計算（デバッグ用）
+            let new_hash: u64 = self.cp.target_board.iter()
+                .flat_map(|color_col| color_col.iter())
+                .fold(0u64, |acc, &val| acc.wrapping_mul(31).wrapping_add(val as u64));
+            
+            vlog!("[頭伸ばし] target_board更新: old_hash={}, new_hash={}", old_hash, new_hash);
+            
             // キャッシュクリア
             self.cp.target_chain_info = None;
             self.cp.around_cells_cache = None;
             self.cp.removed_freetop = None;
             self.push_log(format!(
-                "頭伸ばし成功: {}連鎖 → {}連鎖（候補列={:?}、削除列={}）",
+                "頭伸ばし成功: {}連鎖 → {}連鎖（候補列={:?}、削除列={}）★目標盤面を更新しました",
                 baseline, best_chain,
                 {
                     let mut v: Vec<_> = cand_cols.iter().copied().collect();
@@ -821,7 +857,7 @@ impl App {
                 }, rx
             ));
         } else {
-            println!("[頭伸ばし] 不採用: baseline={} を超える候補なし", baseline);
+            vlog!("[頭伸ばし] 不採用: baseline={} を超える候補なし", baseline);
             self.push_log(format!("頭伸ばし失敗: 連鎖は{}連鎖のまま", baseline));
         }
     }
@@ -1016,6 +1052,12 @@ impl App {
             self.push_log("目標盤面が設定されていません".into());
             return;
         }
+        
+        // デバッグ：現在のtarget_boardのハッシュを出力
+        let current_hash: u64 = self.cp.target_board.iter()
+            .flat_map(|color_col| color_col.iter())
+            .fold(0u64, |acc, &val| acc.wrapping_mul(31).wrapping_add(val as u64));
+        vlog!("[目標配置] 参照するtarget_boardのハッシュ={}", current_hash);
 
         let pair = self.cp_current_pair();
 
@@ -1070,6 +1112,9 @@ impl App {
 
     fn eval_move(&self, x: usize, orient: Orient, pair: (u8, u8)) -> i32 {
         let mut test_cols = self.cp.cols;
+        
+        // 配置する2つのぷよの位置と色を記録
+        let mut placed_puyos: Vec<(usize, usize, u8)> = Vec::new();
 
         match orient {
             Orient::Up => {
@@ -1081,6 +1126,8 @@ impl App {
                 let bit1 = 1u16 << (h + 1);
                 test_cols[pair.0 as usize][x] |= bit0;
                 test_cols[pair.1 as usize][x] |= bit1;
+                placed_puyos.push((x, h, pair.0));
+                placed_puyos.push((x, h + 1, pair.1));
             }
             Orient::Down => {
                 let h = self.cp_col_height(x);
@@ -1091,6 +1138,8 @@ impl App {
                 let bit1 = 1u16 << (h + 1);
                 test_cols[pair.1 as usize][x] |= bit0;
                 test_cols[pair.0 as usize][x] |= bit1;
+                placed_puyos.push((x, h, pair.1));
+                placed_puyos.push((x, h + 1, pair.0));
             }
             Orient::Right => {
                 let h0 = self.test_col_height(&test_cols, x);
@@ -1100,6 +1149,8 @@ impl App {
                 }
                 test_cols[pair.0 as usize][x] |= 1u16 << h0;
                 test_cols[pair.1 as usize][x + 1] |= 1u16 << h1;
+                placed_puyos.push((x, h0, pair.0));
+                placed_puyos.push((x + 1, h1, pair.1));
             }
             Orient::Left => {
                 if x == 0 {
@@ -1112,6 +1163,8 @@ impl App {
                 }
                 test_cols[pair.0 as usize][x] |= 1u16 << h0;
                 test_cols[pair.1 as usize][x - 1] |= 1u16 << h1;
+                placed_puyos.push((x, h0, pair.0));
+                placed_puyos.push((x - 1, h1, pair.1));
             }
         }
 
@@ -1122,6 +1175,23 @@ impl App {
                 score += matched.count_ones() as i32;
             }
         }
+        
+        // 配置したぷよが目標盤面の別の色を上書きしていないかチェック
+        for (px, py, color) in placed_puyos {
+            let bit = 1u16 << py;
+            // この位置に目標盤面でぷよがあるか確認
+            for target_color in 0..4u8 {
+                if (self.cp.target_board[target_color as usize][px] & bit) != 0 {
+                    // 目標盤面にぷよがある
+                    if target_color != color {
+                        // 違う色を上書きしている → 大幅減点
+                        score -= 100;
+                    }
+                    break;
+                }
+            }
+        }
+        
         score
     }
 
@@ -1286,7 +1356,7 @@ impl App {
             visited.insert(pos);
         }
         
-        println!("[周囲9マス探索] 連鎖マス数: {}", chain_cells.len());
+        vlog!("[周囲9マス探索] 連鎖マス数: {}", chain_cells.len());
         
         // 連鎖マスに隣接する配置可能な空マスをキューに追加（距離1）
         for &(cx, cy) in chain_cells {
@@ -1310,11 +1380,11 @@ impl App {
                         queue.push_back(((nxu, nyu), 1));
                         result.insert((nxu, nyu));
                         if result.len() <= 20 {
-                            println!("[周囲9マス探索] 距離1: ({}, {}) 収集数={}", nxu, nyu, result.len());
+                            vlog!("[周囲9マス探索] 距離1: ({}, {}) 収集数={}", nxu, nyu, result.len());
                         }
                         
                         if result.len() >= max_count {
-                            println!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
+                            vlog!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
                             return result;
                         }
                     }
@@ -1322,14 +1392,14 @@ impl App {
             }
         }
         
-        println!("[周囲9マス探索] 距離1探索完了、キューサイズ={}", queue.len());
+        vlog!("[周囲9マス探索] 距離1探索完了、キューサイズ={}", queue.len());
         
         // BFSで更に隣接する配置可能な空マスを探索
         let mut iteration_count = 0;
         while let Some(((cx, cy), dist)) = queue.pop_front() {
             iteration_count += 1;
             if iteration_count > 10000 {
-                println!("[周囲9マス探索] 警告: 10000回反復、強制終了");
+                vlog!("[周囲9マス探索] 警告: 10000回反復、強制終了");
                 break;
             }
             
@@ -1353,11 +1423,11 @@ impl App {
                         queue.push_back(((nxu, nyu), dist + 1));
                         result.insert((nxu, nyu));
                         if result.len() <= 20 {
-                            println!("[周囲9マス探索] 距離{}: ({}, {}) 収集数={}", dist + 1, nxu, nyu, result.len());
+                            vlog!("[周囲9マス探索] 距離{}: ({}, {}) 収集数={}", dist + 1, nxu, nyu, result.len());
                         }
                         
                         if result.len() >= max_count {
-                            println!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
+                            vlog!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
                             return result;
                         }
                     }
@@ -1365,7 +1435,7 @@ impl App {
             }
         }
         
-        println!("[周囲9マス探索] 探索完了、収集数={} 反復回数={}", result.len(), iteration_count);
+        vlog!("[周囲9マス探索] 探索完了、収集数={} 反復回数={}", result.len(), iteration_count);
         result
     }
 
@@ -1511,6 +1581,23 @@ impl App {
                     ui.add(egui::DragValue::new(&mut self.cp.max_depth).clamp_range(1..=20).speed(1.0));
                     ui.label("最大深さ");
                 });
+            });
+            ui.horizontal(|ui| {
+                let prev = self.verbose_logging;
+                ui.checkbox(&mut self.verbose_logging, "詳細ログ出力");
+                if prev != self.verbose_logging {
+                    // グローバルフラグを更新
+                    if self.verbose_logging {
+                        crate::logging::enable_verbose_logging();
+                    } else {
+                        crate::logging::disable_verbose_logging();
+                    }
+                }
+                if self.verbose_logging {
+                    ui.label(RichText::new("（標準出力に詳細ログを出力）").small().color(egui::Color32::GRAY));
+                } else {
+                    ui.label(RichText::new("（標準出力を抑制して高速化）").small().color(egui::Color32::GRAY));
+                }
             });
             ui.horizontal(|ui| {
                 let can_ops = !self.cp.lock && self.cp.anim.is_none();

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::constants::{W, H};
 use super::grid::{Board, find_bottom_empty, in_range, CellData};
+use crate::vlog;
 
 const LOG_GEN_VERBOSE: bool = true;
 use super::detector::Detector;
@@ -37,7 +38,7 @@ impl Generator {
             cand_cols.push(x);
         }
         if LOG_GEN_VERBOSE {
-            println!(
+            vlog!(
                 "  [生成器] iter={} 候補列={:?}（blocked={}） target_color={:?}",
                 iteration,
                 cand_cols,
@@ -49,7 +50,7 @@ impl Generator {
         for &x in &cand_cols {
             let bottom_y = find_bottom_empty(&self.original_field, x).or_else(|| if self.allow_full_column { Some(0) } else { None });
             let Some(bottom_y) = bottom_y else { continue; };
-            if LOG_GEN_VERBOSE { println!("    [生成器] 列{}: 最下段空きy={}", x, bottom_y); }
+            if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 最下段空きy={}", x, bottom_y); }
 
             // 試行色: target_color が指定されていればそれに限定。未指定(None)時のみ近傍隣接色を採用
             let colors_to_try: Vec<u8> = if let Some(tc) = target_color {
@@ -60,7 +61,7 @@ impl Generator {
                 set.into_iter().collect()
             };
             if colors_to_try.is_empty() { continue; }
-            if LOG_GEN_VERBOSE { println!("    [生成器] 列{}: 試行色={:?}", x, colors_to_try); }
+            if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 試行色={:?}", x, colors_to_try); }
 
             for color in colors_to_try {
                 // 列挙版: 多通りの追加配置を候補として収集
@@ -74,10 +75,10 @@ impl Generator {
                     max_keep,
                 );
                 if many.is_empty() {
-                    if LOG_GEN_VERBOSE { println!("      [生成器] 列{}: 色{} 配置不可（スキップ）", x, color); }
+                    if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} 配置不可（スキップ）", x, color); }
                     continue;
                 }
-                if LOG_GEN_VERBOSE { println!("      [生成器] 列{}: 色{} → {}通り", x, color, many.len()); }
+                if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} → {}通り", x, color, many.len()); }
                 for (chain, board_pre_chain, seq) in many {
                     let adds = seq.len();
                     ranked.push((chain, adds, board_pre_chain, (x, bottom_y)));
@@ -91,9 +92,9 @@ impl Generator {
         candidates = ranked.into_iter().map(|(ch, _adds, bd, xy)| (ch, bd, xy)).collect();
 
         // if let Some((best_chain, _f, (bx, by))) = candidates.first() {
-        //     println!("  [生成器] 最良候補: 列{} y={} chain={}（計{}件）", bx, by, best_chain, candidates.len());
+        //     vlog!("  [生成器] 最良候補: 列{} y={} chain={}（計{}件）", bx, by, best_chain, candidates.len());
         // } else if LOG_GEN_VERBOSE {
-        //     println!("  [生成器] 候補0件");
+        //     vlog!("  [生成器] 候補0件");
         // }
         candidates
     }

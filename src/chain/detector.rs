@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::constants::{W, H};
 use super::grid::{Board, CellData, IterId, apply_gravity, get_connected_cells, find_bottom_empty, find_groups_4plus, remove_groups, in_range};
+use crate::vlog;
 
 const LOG_DET_VERBOSE: bool = false;
 const LOG_DET_CHAIN_DETAIL: bool = false;  // 連鎖シミュレーションの詳細ログ（盤面表示など）
@@ -76,7 +77,7 @@ impl Detector {
         
         // デバッグ: 初期盤面を出力
         if LOG_DET_CHAIN_DETAIL {
-            println!("[検出器/DEBUG] 連鎖シミュレーション開始:");
+            vlog!("[検出器/DEBUG] 連鎖シミュレーション開始:");
             for y in (0..H).rev() {
                 let mut line = format!("  y={:2}: ", y);
                 for x in 0..W {
@@ -86,25 +87,25 @@ impl Detector {
                         line.push_str("  .   ");
                     }
                 }
-                println!("{}", line);
+                vlog!("{}", line);
             }
         }
         
         loop {
             let groups = find_groups_4plus(&self.field);
             if groups.is_empty() {
-                if LOG_DET_CHAIN_DETAIL { println!("[検出器/DEBUG] 連鎖{}後: 消せるグループなし → 終了", chain_count); }
+                if LOG_DET_CHAIN_DETAIL { vlog!("[検出器/DEBUG] 連鎖{}後: 消せるグループなし → 終了", chain_count); }
                 break;
             }
             
-            if LOG_DET_CHAIN_DETAIL { println!("[検出器/DEBUG] 連鎖{}: {}個のグループ検出", chain_count, groups.len()); }
+            if LOG_DET_CHAIN_DETAIL { vlog!("[検出器/DEBUG] 連鎖{}: {}個のグループ検出", chain_count, groups.len()); }
             
             if chain_count == 0 {
                 // 1連鎖目: 複数の独立グループが同時に消える構成を不採用
                 if groups.len() > 1 {
                     // デバッグ: 各グループの詳細を出力
                     if LOG_DET_CHAIN_DETAIL {
-                        println!("[検出器/DEBUG] 1連鎖目に{}個のグループ検出:", groups.len());
+                        vlog!("[検出器/DEBUG] 1連鎖目に{}個のグループ検出:", groups.len());
                         for (i, g) in groups.iter().enumerate() {
                             let mut colors = std::collections::HashSet::new();
                             let mut iters = std::collections::HashSet::new();
@@ -114,11 +115,11 @@ impl Detector {
                                     iters.insert(cell.iter.0);
                                 }
                             }
-                            println!("  グループ{}: サイズ={}, 色={:?}, iter={:?}, 位置={:?}", 
+                            vlog!("  グループ{}: サイズ={}, 色={:?}, iter={:?}, 位置={:?}", 
                                      i, g.len(), colors, iters, g);
                         }
                     }
-                    if LOG_DET_VERBOSE { println!("[検出器] 1連鎖目に複数グループ同時消し→不採用: groups={}", groups.len()); }
+                    if LOG_DET_VERBOSE { vlog!("[検出器] 1連鎖目に複数グループ同時消し→不採用: groups={}", groups.len()); }
                     self.last_reject = Some(RejectKind::FirstChainMultipleGroups);
                     return -1;
                 }
@@ -131,7 +132,7 @@ impl Detector {
                         }
                     }
                     if ids_g.len() > 1 {
-                        if LOG_DET_VERBOSE { println!("[検出器] 同一グループ内で異iteration混在→不採用"); }
+                        if LOG_DET_VERBOSE { vlog!("[検出器] 同一グループ内で異iteration混在→不採用"); }
                         self.last_reject = Some(RejectKind::MixedIterationInGroup);
                         return -1;
                     }
@@ -164,12 +165,12 @@ impl Detector {
             // グループを消去して重力適用
             remove_groups(&mut self.field, &groups);
             chain_count += 1;
-            if LOG_DET_CHAIN_DETAIL { println!("[検出器/DEBUG] {}連鎖目: グループ消去後、重力適用前", chain_count); }
+            if LOG_DET_CHAIN_DETAIL { vlog!("[検出器/DEBUG] {}連鎖目: グループ消去後、重力適用前", chain_count); }
             apply_gravity(&mut self.field);
             
             // 重力適用後の盤面を出力
             if LOG_DET_CHAIN_DETAIL {
-                println!("[検出器/DEBUG] {}連鎖目: 重力適用後の盤面:", chain_count);
+                vlog!("[検出器/DEBUG] {}連鎖目: 重力適用後の盤面:", chain_count);
                 for y in (0..H).rev() {
                     let mut line = format!("  y={:2}: ", y);
                     for x in 0..W {
@@ -179,7 +180,7 @@ impl Detector {
                             line.push_str("  .   ");
                         }
                     }
-                    println!("{}", line);
+                    vlog!("{}", line);
                 }
             }
         }
@@ -217,7 +218,7 @@ impl Detector {
         _previous_additions: Option<&HashMap<(usize,usize), CellData>>,
         iteration: u8,
     ) -> bool {
-        // println!(
+        // vlog!(
         //     "[検出器] 追加配置探索開始: iter={}, 基点=({},{}), 色={}, blocked={}",
         //     iteration,
         //     x,
@@ -245,7 +246,7 @@ impl Detector {
             }
         }
         if adj_groups.is_empty() {
-            println!("[検出器] 隣接する同色ぷよがないため中断");
+            vlog!("[検出器] 隣接する同色ぷよがないため中断");
             return false;
         }
 
@@ -266,7 +267,7 @@ impl Detector {
         let needed = 4usize.saturating_sub(effective_adjacent);
 
         let mut placed_positions: Vec<(usize,usize)> = Vec::new();
-        println!(
+        vlog!(
             "[検出器] A集合|隣接点数={} / 許可列={:?} / 必要追加={}",
             adjacency_base.len(),
             {
@@ -302,20 +303,20 @@ impl Detector {
                     }
                 }
                 let Some(final_y) = final_y else {
-                    println!("[検出器] 列{}: 新規落下位置を特定できずスキップ", col);
+                    vlog!("[検出器] 列{}: 新規落下位置を特定できずスキップ", col);
                     continue;
                 };
 
                 // Aグループと隣接か
                 if !is_adjacent_to(&adjacency_base, col, final_y) {
-                    println!("[検出器] 列{}: Aグループに隣接しないため却下 (y={})", col, final_y);
+                    vlog!("[検出器] 列{}: Aグループに隣接しないため却下 (y={})", col, final_y);
                     continue;
                 }
 
                 // 連鎖評価
                 let mut det = Detector::new(tmp.clone());
                 let chain = det.simulate_chain();
-                println!("[検出器] 列{}: 候補(y={}) → chain={}", col, final_y, chain);
+                vlog!("[検出器] 列{}: 候補(y={}) → chain={}", col, final_y, chain);
                 if chain > best_chain {
                     best_chain = chain;
                     best_field = Some(tmp);
@@ -324,7 +325,7 @@ impl Detector {
             }
 
             let Some(bf) = best_field else {
-                println!("[検出器] 追加候補が見つからず中断");
+                vlog!("[検出器] 追加候補が見つからず中断");
                 return false;
             };
             let (col, fy) = best_pos.unwrap();
@@ -334,9 +335,9 @@ impl Detector {
             if col > 0 { allowed_cols.insert(col-1); }
             if col + 1 < W { allowed_cols.insert(col+1); }
             placed_positions.push((col, fy));
-            println!("[検出器] 追加確定: 列{} y={}", col, fy);
+            vlog!("[検出器] 追加確定: 列{} y={}", col, fy);
         }
-        println!("[検出器] 追加完了: {}個", placed_positions.len());
+        vlog!("[検出器] 追加完了: {}個", placed_positions.len());
         true
     }
 
@@ -351,7 +352,7 @@ impl Detector {
         _previous_additions: Option<&HashMap<(usize,usize), CellData>>,
         iteration: u8,
     ) -> bool {
-        // println!(
+        // vlog!(
         //     "[検出器/BF] 追加配置(総当たり)開始: iter={}, 基点=({},{}), 色={}, blocked={}",
         //     iteration, x, y, color_name(base_color), blocked_columns.map(|b| b.len()).unwrap_or(0)
         // );
@@ -370,7 +371,7 @@ impl Detector {
                 if !adj_groups.iter().any(|ex| intersects(&g, ex)) { adj_groups.push(g); }
             }}
         }
-        if adj_groups.is_empty() { println!("[検出器/BF] 隣接する同色ぷよがないため中断"); return false; }
+        if adj_groups.is_empty() { vlog!("[検出器/BF] 隣接する同色ぷよがないため中断"); return false; }
 
         let mut puyo_a: BTreeSet<(usize,usize)> = BTreeSet::new();
         for g in &adj_groups { for &p in g { puyo_a.insert(p); } }
@@ -385,7 +386,7 @@ impl Detector {
         let total_adjacent: usize = adj_groups.iter().map(|g| g.len()).sum();
         let effective_adjacent = if total_adjacent < 4 { total_adjacent } else { 3 };
         let needed = 4usize.saturating_sub(effective_adjacent);
-        println!(
+        vlog!(
             "        → A集合|隣接点数={} / 許可列={:?} / 必要追加={}",
             adjacency_base.len(),
             {
@@ -410,7 +411,7 @@ impl Detector {
             if depth == 0 {
                 let mut cols_dbg: Vec<_> = allowed_cols.iter().copied().collect();
                 cols_dbg.sort_unstable();
-                println!(
+                vlog!(
                     "[検出器/BF-DFS] depth={} 開始: needed={} / 許可列={:?} / A|B点数={}",
                     depth, needed, cols_dbg, adjacency_base.len()
                 );
@@ -419,7 +420,7 @@ impl Detector {
                 // スコアは連鎖後で評価するが、返す盤面は「連鎖前（追加+重力適用済み）」を保持する
                 let mut det = Detector::new(cur_field.clone());
                 let chain = det.simulate_chain();
-                println!("[検出器/BF-DFS]{} 葉: chain={}", indent, chain);
+                vlog!("[検出器/BF-DFS]{} 葉: chain={}", indent, chain);
                 return Some((chain, cur_field.clone(), Vec::new()));
             }
 
@@ -427,8 +428,8 @@ impl Detector {
             let mut cols: Vec<usize> = allowed_cols.iter().copied().collect();
             cols.sort_unstable();
             for col in cols {
-                if let Some(bl) = blocked_columns { if bl.contains(&col) { println!("[検出器/BF-DFS]{} 列{}: ブロック列のためスキップ", indent, col); continue; } }
-                let Some(cand_y) = find_bottom_empty(cur_field, col) else { println!("[検出器/BF-DFS]{} 列{}: 空き無しでスキップ", indent, col); continue; };
+                if let Some(bl) = blocked_columns { if bl.contains(&col) { vlog!("[検出器/BF-DFS]{} 列{}: ブロック列のためスキップ", indent, col); continue; } }
+                let Some(cand_y) = find_bottom_empty(cur_field, col) else { vlog!("[検出器/BF-DFS]{} 列{}: 空き無しでスキップ", indent, col); continue; };
                 let mut cand = cur_field.clone();
                 cand[cand_y][col] = Some(CellData{ color: base_color, iter: IterId(iteration), original_pos: None });
                 let mut tmp = cand.clone();
@@ -436,10 +437,10 @@ impl Detector {
                 // 新規落下位置
                 let mut final_y: Option<usize> = None;
                 for yy in 0..H { if tmp[yy][col].is_some() && cur_field[yy][col].is_none() { final_y = Some(yy); break; } }
-                let Some(final_y) = final_y else { println!("[検出器/BF-DFS]{} 列{}: 落下位置特定できず", indent, col); continue; };
-                if !is_adjacent_to(adjacency_base, col, final_y) { println!("[検出器/BF-DFS]{} 列{}: A∪Bに非隣接 (y={})", indent, col, final_y); continue; }
+                let Some(final_y) = final_y else { vlog!("[検出器/BF-DFS]{} 列{}: 落下位置特定できず", indent, col); continue; };
+                if !is_adjacent_to(adjacency_base, col, final_y) { vlog!("[検出器/BF-DFS]{} 列{}: A∪Bに非隣接 (y={})", indent, col, final_y); continue; }
 
-                println!("[検出器/BF-DFS]{} 列{}: 追加 → y={} (残りneeded={})", indent, col, final_y, needed);
+                vlog!("[検出器/BF-DFS]{} 列{}: 追加 → y={} (残りneeded={})", indent, col, final_y, needed);
 
                 let mut next_adj = adjacency_base.clone();
                 next_adj.insert((col, final_y));
@@ -452,7 +453,7 @@ impl Detector {
                     let mut take = (sc, bf, seq);
                     take.2.push((col, final_y));
                     if best.as_ref().map(|b| b.0).unwrap_or(i32::MIN) < sc {
-                        println!("[検出器/BF-DFS]{} ベスト更新: chain={} at 列{} y={} (seq_len={})", indent, sc, col, final_y, take.2.len());
+                        vlog!("[検出器/BF-DFS]{} ベスト更新: chain={} at 列{} y={} (seq_len={})", indent, sc, col, final_y, take.2.len());
                         best = Some(take);
                     }
                 }
@@ -462,14 +463,14 @@ impl Detector {
 
         if let Some((best_chain, best_field, seq)) = dfs(&self.field, &adjacency_base, &allowed_cols, needed, base_color, iteration, blocked_columns, 0) {
             if best_chain < 0 {
-                println!("[検出器/BF] 最良候補は異iteration同時消しのため不採用 (chain={})", best_chain);
+                vlog!("[検出器/BF] 最良候補は異iteration同時消しのため不採用 (chain={})", best_chain);
                 return false;
             }
-            println!("[検出器/BF] 追加確定(総当たり): chain={} / 配置={:?}", best_chain, seq);
+            vlog!("[検出器/BF] 追加確定(総当たり): chain={} / 配置={:?}", best_chain, seq);
             self.field = best_field;
             return true;
         }
-        println!("[検出器/BF] 候補なし");
+        vlog!("[検出器/BF] 候補なし");
         false
     }
 
@@ -485,7 +486,7 @@ impl Detector {
         iteration: u8,
         max_keep: usize,
     ) -> Vec<(i32, Board, Vec<(usize,usize)>)> {
-        println!(
+        vlog!(
             "      [検出器] 基点=({},{}), 色={}",
             x, y, color_name(base_color)
         );
@@ -505,7 +506,7 @@ impl Detector {
             }}
         }
         if adj_groups.is_empty() { 
-            println!("        → 隣接する同色ぷよがないため中断"); 
+            vlog!("        → 隣接する同色ぷよがないため中断"); 
             return Vec::new(); 
         }
 
@@ -522,7 +523,7 @@ impl Detector {
         let total_adjacent: usize = adj_groups.iter().map(|g| g.len()).sum();
         let effective_adjacent = if total_adjacent < 4 { total_adjacent } else { 3 };
         let needed = 4usize.saturating_sub(effective_adjacent);
-        println!(
+        vlog!(
             "        → A集合|隣接点数={} / 許可列={:?} / 必要追加={}",
             adjacency_base.len(),
             {
@@ -604,7 +605,7 @@ impl Detector {
         // スコア降順で並べ、max_keepにトリミング
         results.sort_by(|a,b| b.0.cmp(&a.0));
         if max_keep > 0 && results.len() > max_keep { results.truncate(max_keep); }
-        println!("        → 列挙完了: {}件", results.len());
+        vlog!("        → 列挙完了: {}件", results.len());
         results
     }
 }

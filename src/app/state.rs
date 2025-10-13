@@ -32,6 +32,7 @@ pub struct App {
     pub log_lines: Vec<String>,
     pub mode: Mode,
     pub cp: ChainPlay,
+    pub verbose_logging: bool,
 }
 
 impl Default for App {
@@ -59,6 +60,7 @@ impl Default for App {
             log_lines: vec!["待機中".into()],
             mode: Mode::BruteForce,
             cp: ChainPlay::default(),
+            verbose_logging: false,
         }
     }
 }
