@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 
 use crate::constants::{W, H};
-use super::grid::{Board, CellData, IterId, apply_gravity, get_connected_cells, find_bottom_empty, find_groups_4plus, remove_groups, in_range};
+use super::grid::{Board, CellData, IterId, apply_gravity, get_connected_cells, find_bottom_empty, find_groups_4plus, remove_groups, in_range, board_to_cols};
+use crate::search::hash::canonical_hash64_fast;
+use crate::search::board::pack_cols;
 use crate::vlog;
 
 const LOG_DET_VERBOSE: bool = false;
@@ -74,6 +78,18 @@ impl Detector {
         self.last_reject = None;
         self.chain_history.clear();
         let mut chain_count: i32 = 0;
+        
+        // ビットボードで高速事前チェック：4個以上の色がなければ早期リターン
+        let cols = board_to_cols(&self.field);
+        let bb = pack_cols(&cols);
+        let has_potential = (bb[0].count_ones() >= 4)
+            || (bb[1].count_ones() >= 4)
+            || (bb[2].count_ones() >= 4)
+            || (bb[3].count_ones() >= 4);
+        
+        if !has_potential {
+            return 0;
+        }
         
         // デバッグ: 初期盤面を出力
         if LOG_DET_CHAIN_DETAIL {
@@ -545,69 +561,108 @@ impl Detector {
             return vec![(chain, self.field.clone(), Vec::new())];
         }
 
-        // 収集配列
-        let mut results: Vec<(i32, Board, Vec<(usize,usize)>)> = Vec::new();
-
-        // 再帰で総当たり列挙
-        fn dfs_collect(
-            cur_field: &Board,
-            adjacency_base: &HashSet<(usize,usize)>,
-            allowed_cols: &HashSet<usize>,
-            needed: usize,
-            base_color: u8,
-            iteration: u8,
-            blocked_columns: Option<&HashSet<usize>>,
-            depth: usize,
-            path: &mut Vec<(usize,usize)>,
-            out: &mut Vec<(i32, Board, Vec<(usize,usize)>)>,
-        ) {
-            if needed == 0 {
-                let mut det = Detector::new(cur_field.clone());
-                let chain = det.simulate_chain();
-                out.push((chain, cur_field.clone(), path.clone()));
-                return;
-            }
+        // 並列化：needed >= 2 の場合、最初の1個目の配置候補で分岐（重複排除付き）
+        if needed >= 2 {
             let mut cols: Vec<usize> = allowed_cols.iter().copied().collect();
             cols.sort_unstable();
-            for col in cols {
-                if let Some(bl) = blocked_columns { if bl.contains(&col) { continue; } }
-                let Some(cand_y) = find_bottom_empty(cur_field, col) else { continue; };
-                let mut cand = cur_field.clone();
-                cand[cand_y][col] = Some(CellData{ color: base_color, iter: IterId(iteration), original_pos: None });
-                let mut tmp = cand.clone();
-                apply_gravity(&mut tmp);
-                // 新規落下位置
-                let mut final_y: Option<usize> = None;
-                for yy in 0..H { if tmp[yy][col].is_some() && cur_field[yy][col].is_none() { final_y = Some(yy); break; } }
-                let Some(final_y) = final_y else { continue; };
-                if !is_adjacent_to(adjacency_base, col, final_y) { continue; }
-
-                let mut next_adj = adjacency_base.clone();
-                next_adj.insert((col, final_y));
-                let mut next_allowed = allowed_cols.clone();
-                next_allowed.insert(col);
-                if col > 0 { next_allowed.insert(col-1); }
-                if col + 1 < W { next_allowed.insert(col+1); }
-
-                path.push((col, final_y));
-                dfs_collect(&tmp, &next_adj, &next_allowed, needed-1, base_color, iteration, blocked_columns, depth+1, path, out);
-                path.pop();
-            }
+            
+            // グローバル重複排除用
+            let global_seen = Arc::new(Mutex::new(HashSet::new()));
+            
+            // 各列での最初の配置を並列処理
+            let all_results: Vec<Vec<(i32, Board, Vec<(usize,usize)>)>> = cols
+                .par_iter()
+                .filter_map(|&col| {
+                    let global_seen = Arc::clone(&global_seen);
+                    if let Some(bl) = blocked_columns { if bl.contains(&col) { return None; } }
+                    let cand_y = find_bottom_empty(&self.field, col)?;
+                    
+                    let mut cand = self.field.clone();
+                    cand[cand_y][col] = Some(CellData{ color: base_color, iter: IterId(iteration), original_pos: None });
+                    let mut tmp = cand.clone();
+                    apply_gravity(&mut tmp);
+                    
+                    // 新規落下位置
+                    let mut final_y: Option<usize> = None;
+                    for yy in 0..H { if tmp[yy][col].is_some() && self.field[yy][col].is_none() { final_y = Some(yy); break; } }
+                    let final_y = final_y?;
+                    
+                    if !is_adjacent_to(&adjacency_base, col, final_y) { return None; }
+                    
+                    // この配置から残りを探索
+                    let mut next_adj = adjacency_base.clone();
+                    next_adj.insert((col, final_y));
+                    let mut next_allowed = allowed_cols.clone();
+                    next_allowed.insert(col);
+                    if col > 0 { next_allowed.insert(col-1); }
+                    if col + 1 < W { next_allowed.insert(col+1); }
+                    
+                    let mut local_results = Vec::new();
+                    let mut path = vec![(col, final_y)];
+                    let mut local_seen = HashSet::new();
+                    
+                    dfs_collect_serial_deduplicated(
+                        &tmp,
+                        &next_adj,
+                        &next_allowed,
+                        needed - 1,
+                        base_color,
+                        iteration,
+                        blocked_columns,
+                        0,
+                        &mut path,
+                        &mut local_results,
+                        &mut local_seen,
+                    );
+                    
+                    // グローバル重複チェック
+                    let mut global_lock = global_seen.lock().unwrap();
+                    let filtered: Vec<_> = local_results.into_iter()
+                        .filter(|(_, board, _)| {
+                            let hash = compute_board_hash_simple(board);
+                            global_lock.insert(hash)
+                        })
+                        .collect();
+                    drop(global_lock);
+                    
+                    if filtered.is_empty() { None } else { Some(filtered) }
+                })
+                .collect();
+            
+            // 結果を統合
+            let mut results: Vec<(i32, Board, Vec<(usize,usize)>)> = 
+                all_results.into_iter().flatten().collect();
+            
+            // スコア降順で並べ、max_keepにトリミング
+            results.sort_by(|a,b| b.0.cmp(&a.0));
+            if max_keep > 0 && results.len() > max_keep { results.truncate(max_keep); }
+            let dedup_count = Arc::try_unwrap(global_seen).unwrap().into_inner().unwrap().len();
+            vlog!("        → 並列列挙完了: {}件, 重複排除={}", results.len(), dedup_count);
+            return results;
         }
-
-        let mut path: Vec<(usize,usize)> = Vec::new();
-        dfs_collect(
-            &self.field,
-            &adjacency_base,
-            &allowed_cols,
-            needed,
-            base_color,
-            iteration,
-            blocked_columns,
-            0,
-            &mut path,
-            &mut results,
-        );
+        
+        // needed == 1 の場合は単純にループ
+        let mut results: Vec<(i32, Board, Vec<(usize,usize)>)> = Vec::new();
+        let mut cols: Vec<usize> = allowed_cols.iter().copied().collect();
+        cols.sort_unstable();
+        
+        for col in cols {
+            if let Some(bl) = blocked_columns { if bl.contains(&col) { continue; } }
+            let Some(cand_y) = find_bottom_empty(&self.field, col) else { continue; };
+            let mut cand = self.field.clone();
+            cand[cand_y][col] = Some(CellData{ color: base_color, iter: IterId(iteration), original_pos: None });
+            let mut tmp = cand.clone();
+            apply_gravity(&mut tmp);
+            
+            let mut final_y: Option<usize> = None;
+            for yy in 0..H { if tmp[yy][col].is_some() && self.field[yy][col].is_none() { final_y = Some(yy); break; } }
+            let Some(final_y) = final_y else { continue; };
+            if !is_adjacent_to(&adjacency_base, col, final_y) { continue; }
+            
+            let mut det = Detector::new(tmp.clone());
+            let chain = det.simulate_chain();
+            results.push((chain, tmp, vec![(col, final_y)]));
+        }
 
         // スコア降順で並べ、max_keepにトリミング
         results.sort_by(|a,b| b.0.cmp(&a.0));
@@ -615,6 +670,65 @@ impl Detector {
         vlog!("        → 列挙完了: {}件", results.len());
         results
     }
+}
+
+// シリアル版のDFS収集（重複排除付き）
+fn dfs_collect_serial_deduplicated(
+    cur_field: &Board,
+    adjacency_base: &HashSet<(usize,usize)>,
+    allowed_cols: &HashSet<usize>,
+    needed: usize,
+    base_color: u8,
+    iteration: u8,
+    blocked_columns: Option<&HashSet<usize>>,
+    _depth: usize,
+    path: &mut Vec<(usize,usize)>,
+    out: &mut Vec<(i32, Board, Vec<(usize,usize)>)>,
+    seen: &mut HashSet<u64>,
+) {
+    if needed == 0 {
+        let hash = compute_board_hash_simple(cur_field);
+        if seen.insert(hash) {
+            let mut det = Detector::new(cur_field.clone());
+            let chain = det.simulate_chain();
+            out.push((chain, cur_field.clone(), path.clone()));
+        }
+        return;
+    }
+    let mut cols: Vec<usize> = allowed_cols.iter().copied().collect();
+    cols.sort_unstable();
+    for col in cols {
+        if let Some(bl) = blocked_columns { if bl.contains(&col) { continue; } }
+        let Some(cand_y) = find_bottom_empty(cur_field, col) else { continue; };
+        let mut cand = cur_field.clone();
+        cand[cand_y][col] = Some(CellData{ color: base_color, iter: IterId(iteration), original_pos: None });
+        let mut tmp = cand.clone();
+        apply_gravity(&mut tmp);
+        // 新規落下位置
+        let mut final_y: Option<usize> = None;
+        for yy in 0..H { if tmp[yy][col].is_some() && cur_field[yy][col].is_none() { final_y = Some(yy); break; } }
+        let Some(final_y) = final_y else { continue; };
+        if !is_adjacent_to(adjacency_base, col, final_y) { continue; }
+
+        let mut next_adj = adjacency_base.clone();
+        next_adj.insert((col, final_y));
+        let mut next_allowed = allowed_cols.clone();
+        next_allowed.insert(col);
+        if col > 0 { next_allowed.insert(col-1); }
+        if col + 1 < W { next_allowed.insert(col+1); }
+
+        path.push((col, final_y));
+        dfs_collect_serial_deduplicated(&tmp, &next_adj, &next_allowed, needed-1, base_color, iteration, blocked_columns, 0, path, out, seen);
+        path.pop();
+    }
+}
+
+/// 盤面の正規化ハッシュ計算（ミラー対称を考慮）
+fn compute_board_hash_simple(board: &Board) -> u64 {
+    // Boardをcols形式に変換してから正規化ハッシュを適用
+    let cols = board_to_cols(board);
+    let (hash, _mirror) = canonical_hash64_fast(&cols);
+    hash
 }
 
 fn intersects(a: &Vec<(usize,usize)>, b: &Vec<(usize,usize)>) -> bool {

@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 
 use crate::constants::{W, H};
-use super::grid::{Board, find_bottom_empty, in_range, CellData};
+use super::grid::{Board, find_bottom_empty, in_range, CellData, board_to_cols};
+use crate::search::hash::canonical_hash64_fast;
 use crate::vlog;
 
 const LOG_GEN_VERBOSE: bool = true;
@@ -26,10 +28,6 @@ impl Generator {
         previous_additions: Option<&HashMap<(usize,usize), CellData>>,
         iteration: u8,
     ) -> Vec<(i32, Board, (usize, usize))> {
-        // 最終返却用（chain, board, seed座標）
-        let mut candidates: Vec<(i32, Board, (usize, usize))> = Vec::new();
-        // ランキング用に追加数も保持（chain, adds, board, seed座標）
-        let mut ranked: Vec<(i32, usize, Board, (usize, usize))> = Vec::new();
         let mut cand_cols: Vec<usize> = Vec::new();
         if let Some(pref) = preferred_columns { let mut v: Vec<_> = pref.iter().copied().collect(); v.sort_unstable(); cand_cols.extend(v); }
         for x in 0..W {
@@ -47,49 +45,67 @@ impl Generator {
             );
         }
 
-        for &x in &cand_cols {
-            let bottom_y = find_bottom_empty(&self.original_field, x).or_else(|| if self.allow_full_column { Some(0) } else { None });
-            let Some(bottom_y) = bottom_y else { continue; };
-            if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 最下段空きy={}", x, bottom_y); }
+        // 並列化：各候補列での評価を並列処理
+        let all_ranked: Vec<Vec<(i32, usize, Board, (usize, usize))>> = cand_cols
+            .par_iter()
+            .filter_map(|&x| {
+                let bottom_y = find_bottom_empty(&self.original_field, x).or_else(|| if self.allow_full_column { Some(0) } else { None })?;
+                if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 最下段空きy={}", x, bottom_y); }
 
-            // 試行色: target_color が指定されていればそれに限定。未指定(None)時のみ近傍隣接色を採用
-            let colors_to_try: Vec<u8> = if let Some(tc) = target_color {
-                vec![tc]
-            } else {
-                let mut set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-                for c in self.get_neighbor_colors(x, bottom_y) { set.insert(c); }
-                set.into_iter().collect()
-            };
-            if colors_to_try.is_empty() { continue; }
-            if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 試行色={:?}", x, colors_to_try); }
+                // 試行色: target_color が指定されていればそれに限定。未指定(None)時のみ近傍隣接色を採用
+                let colors_to_try: Vec<u8> = if let Some(tc) = target_color {
+                    vec![tc]
+                } else {
+                    let mut set: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+                    for c in self.get_neighbor_colors(x, bottom_y) { set.insert(c); }
+                    set.into_iter().collect()
+                };
+                if colors_to_try.is_empty() { return None; }
+                if LOG_GEN_VERBOSE { vlog!("    [生成器] 列{}: 試行色={:?}", x, colors_to_try); }
 
-            for color in colors_to_try {
-                // 列挙版: 多通りの追加配置を候補として収集
-                let det = Detector::new(self.original_field.clone());
-                let max_keep = 64usize; // 返却上限（必要に応じて拡張可）
-                let many = det.enumerate_additions_for_color_bruteforce(
-                    x, bottom_y, color,
-                    blocked_columns,
-                    previous_additions,
-                    iteration,
-                    max_keep,
-                );
-                if many.is_empty() {
-                    if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} 配置不可（スキップ）", x, color); }
-                    continue;
+                let mut local_ranked: Vec<(i32, usize, Board, (usize, usize))> = Vec::new();
+                
+                for color in colors_to_try {
+                    // 列挙版: 多通りの追加配置を候補として収集
+                    let det = Detector::new(self.original_field.clone());
+                    let max_keep = 64usize; // 返却上限（必要に応じて拡張可）
+                    let many = det.enumerate_additions_for_color_bruteforce(
+                        x, bottom_y, color,
+                        blocked_columns,
+                        previous_additions,
+                        iteration,
+                        max_keep,
+                    );
+                    if many.is_empty() {
+                        if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} 配置不可（スキップ）", x, color); }
+                        continue;
+                    }
+                    if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} → {}通り", x, color, many.len()); }
+                    for (chain, board_pre_chain, seq) in many {
+                        let adds = seq.len();
+                        local_ranked.push((chain, adds, board_pre_chain, (x, bottom_y)));
+                    }
                 }
-                if LOG_GEN_VERBOSE { vlog!("      [生成器] 列{}: 色{} → {}通り", x, color, many.len()); }
-                for (chain, board_pre_chain, seq) in many {
-                    let adds = seq.len();
-                    ranked.push((chain, adds, board_pre_chain, (x, bottom_y)));
-                }
+                
+                if local_ranked.is_empty() { None } else { Some(local_ranked) }
+            })
+            .collect();
+        
+        // 結果を統合（重複排除付き）
+        let mut seen_hashes = std::collections::HashSet::new();
+        let mut ranked: Vec<(i32, usize, Board, (usize, usize))> = Vec::new();
+        
+        for item in all_ranked.into_iter().flatten() {
+            let hash = compute_board_hash_for_generator(&item.2);
+            if seen_hashes.insert(hash) {
+                ranked.push(item);
             }
         }
 
         // chain 降順, adds 昇順で並べ替え
         ranked.sort_by(|a,b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         // 返却型にマッピング
-        candidates = ranked.into_iter().map(|(ch, _adds, bd, xy)| (ch, bd, xy)).collect();
+        let candidates: Vec<(i32, Board, (usize, usize))> = ranked.into_iter().map(|(ch, _adds, bd, xy)| (ch, bd, xy)).collect();
 
         // if let Some((best_chain, _f, (bx, by))) = candidates.first() {
         //     vlog!("  [生成器] 最良候補: 列{} y={} chain={}（計{}件）", bx, by, best_chain, candidates.len());
@@ -110,4 +126,12 @@ impl Generator {
         }
         s.into_iter().collect()
     }
+}
+
+/// 盤面の正規化ハッシュ計算（Generator用、ミラー対称を考慮）
+fn compute_board_hash_for_generator(board: &Board) -> u64 {
+    // Boardをcols形式に変換してから正規化ハッシュを適用
+    let cols = board_to_cols(board);
+    let (hash, _mirror) = canonical_hash64_fast(&cols);
+    hash
 }

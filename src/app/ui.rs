@@ -7,6 +7,8 @@ use crossbeam_channel::unbounded;
 use egui::{Color32, RichText, Vec2};
 use rand::Rng;
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
+use std::collections::HashSet;
 
 use crate::constants::{W, H};
 use crate::model::{Cell, cell_style, cycle_abs, cycle_any, cycle_fixed};
@@ -15,6 +17,7 @@ use crate::app::chain_play::{ChainPlay, SavedState, AnimState, AnimPhase, Orient
 use crate::profiling::{ProfileTotals, has_profile_any, fmt_dur_ms};
 use crate::search::run_search;
 use crate::search::board::{apply_clear_no_fall, apply_erase_and_fall_cols};
+use crate::search::hash::canonical_hash64_fast;
 use crate::vlog;
 
 /// ペアプレビューの描画
@@ -493,7 +496,93 @@ impl App {
     /// 候補位置に各色のぷよを配置する総当たり（重力適用後に連鎖検出）
     /// 各位置に0〜3の色または空欄を割り当てる全組み合わせを試す（5^N通り）
     /// フリートップ列が1列以上残っている配置のみ有効
+    /// 並列化版：先頭の候補で分岐して並列処理
     fn try_add_puyos_bruteforce_all_colors(
+        &self,
+        base_board: &crate::chain::Board,
+        candidates: &[(usize, usize)],
+        baseline: i32,
+        max_results: usize,
+        first_chain_top: &std::collections::HashMap<usize, usize>,
+    ) -> Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        
+        // 候補が少ない場合は単一スレッドで実行
+        if candidates.len() <= 3 {
+            return self.try_add_puyos_bruteforce_single_thread(
+                base_board, candidates, baseline, max_results, first_chain_top
+            );
+        }
+        
+        // 並列化：先頭の候補位置で分岐（5通り：空欄 + 4色）
+        let first_pos = candidates[0];
+        let rest_candidates = &candidates[1..];
+        
+        vlog!("  [並列総当たり] 先頭={:?}, 残り={} 候補", first_pos, rest_candidates.len());
+        
+        // 5通りの初期配置を並列処理（重複排除付き）
+        let initial_placements: Vec<Option<u8>> = vec![None, Some(0), Some(1), Some(2), Some(3)];
+        
+        let all_results: Vec<Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)>> = initial_placements
+            .par_iter()
+            .map(|&first_color| {
+                let mut local_placed = Vec::new();
+                if let Some(color) = first_color {
+                    local_placed.push((first_pos.0, first_pos.1, color));
+                }
+                
+                let mut local_results = Vec::new();
+                let mut local_trial_count = 0usize;
+                let mut local_seen_hashes = HashSet::new();  // 重複排除用
+                
+                Self::dfs_bruteforce_deduplicated(
+                    base_board,
+                    rest_candidates,
+                    0,
+                    &mut local_placed,
+                    &mut local_results,
+                    baseline,
+                    max_results / 5 + 1,  // 各スレッドに上限を分配
+                    &mut local_trial_count,
+                    first_chain_top,
+                    &mut local_seen_hashes,
+                );
+                
+                vlog!("  [並列総当たり] 初期配置={:?}: 試行数={}, 結果={}, 重複排除={}", 
+                         first_color, local_trial_count, local_results.len(), local_seen_hashes.len());
+                
+                local_results
+            })
+            .collect();
+        
+        // 結果を統合してソート（グローバル重複排除）
+        let mut global_seen = HashSet::new();
+        let mut combined_results: Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)> = Vec::new();
+        
+        for result in all_results.into_iter().flatten() {
+            let cols = crate::chain::board_to_cols(&result.1);
+            let hash = Self::compute_board_hash(&cols);
+            
+            if global_seen.insert(hash) {
+                combined_results.push(result);
+            }
+        }
+        
+        combined_results.sort_by(|a, b| b.0.cmp(&a.0));  // 連鎖数降順
+        
+        if combined_results.len() > max_results {
+            combined_results.truncate(max_results);
+        }
+        
+        vlog!("  [並列総当たり] 統合完了: 結果={} 件", combined_results.len());
+        
+        combined_results
+    }
+    
+    /// 単一スレッド版の総当たり（候補数が少ない場合用）
+    fn try_add_puyos_bruteforce_single_thread(
         &self,
         base_board: &crate::chain::Board,
         candidates: &[(usize, usize)],
@@ -503,23 +592,41 @@ impl App {
     ) -> Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)> {
         let mut results = Vec::new();
         let mut trial_count = 0usize;
+        let mut placed = Vec::new();
+        let mut seen_hashes = HashSet::new();
         
-        // 再帰で全色の組み合わせを生成
-        fn dfs(
-            base_board: &crate::chain::Board,
-            candidates: &[(usize, usize)],
-            idx: usize,
-            placed: &mut Vec<(usize, usize, u8)>,
-            results: &mut Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)>,
-            baseline: i32,
-            max_results: usize,
-            trial_count: &mut usize,
-            first_chain_top: &std::collections::HashMap<usize, usize>,
-        ) {
-            if *trial_count == 0 && idx == 0 {
-                vlog!("  [dfs] 初回呼び出し: idx={}, candidates.len()={}", idx, candidates.len());
-            }
-            
+        Self::dfs_bruteforce_deduplicated(
+            base_board, candidates, 0, &mut placed, &mut results, 
+            baseline, max_results, &mut trial_count, first_chain_top, &mut seen_hashes
+        );
+        
+        vlog!("  [単一総当たり] dfs完了: 試行数={}, ベースライン超え={} 件, 重複排除={}", 
+                 trial_count, results.len(), seen_hashes.len());
+        
+        results
+    }
+    
+    /// 盤面のハッシュ値を計算（正規化版：ミラー対称を考慮）
+    fn compute_board_hash(cols: &[[u16; W]; 4]) -> u64 {
+        // 総当たりタブと同じ正規化ハッシュを使用
+        // ミラー対称の盤面は同じハッシュになる
+        let (hash, _mirror) = canonical_hash64_fast(cols);
+        hash
+    }
+    
+    /// DFS本体（重複排除版）
+    fn dfs_bruteforce_deduplicated(
+        base_board: &crate::chain::Board,
+        candidates: &[(usize, usize)],
+        idx: usize,
+        placed: &mut Vec<(usize, usize, u8)>,
+        results: &mut Vec<(i32, crate::chain::Board, Vec<(usize, usize, u8)>)>,
+        baseline: i32,
+        max_results: usize,
+        trial_count: &mut usize,
+        first_chain_top: &std::collections::HashMap<usize, usize>,
+        seen_hashes: &mut HashSet<u64>,
+    ) {
             if idx == candidates.len() {
                 // 全位置に色を割り当て完了
                 
@@ -660,11 +767,16 @@ impl App {
                              trial_count, chain, placed);
                 }
                 
-                // ベースラインを超える場合のみ結果に追加
+                // ベースラインを超える場合のみ結果に追加（重複チェック付き）
                 if chain > baseline {
-                    results.push((chain, board, placed.clone()));
-                    if results.len() >= max_results {
-                        return; // 上限到達で打ち切り
+                    let cols = crate::chain::board_to_cols(&board);
+                    let hash = Self::compute_board_hash(&cols);
+                    
+                    if seen_hashes.insert(hash) {
+                        results.push((chain, board, placed.clone()));
+                        if results.len() >= max_results {
+                            return; // 上限到達で打ち切り
+                        }
                     }
                 }
                 return;
@@ -673,8 +785,13 @@ impl App {
             // 現在の位置に各色を試す（空欄も含む）
             let (x, y) = candidates[idx];
             
+            // 早期枝刈り：結果が上限に達したら打ち切り
+            if results.len() >= max_results {
+                return;
+            }
+            
             // 空欄を試す
-            dfs(base_board, candidates, idx + 1, placed, results, baseline, max_results, trial_count, first_chain_top);
+            Self::dfs_bruteforce_deduplicated(base_board, candidates, idx + 1, placed, results, baseline, max_results, trial_count, first_chain_top, seen_hashes);
             if results.len() >= max_results {
                 return;
             }
@@ -682,23 +799,13 @@ impl App {
             // 各色を試す
             for color in 0..4u8 {
                 placed.push((x, y, color));
-                dfs(base_board, candidates, idx + 1, placed, results, baseline, max_results, trial_count, first_chain_top);
+                Self::dfs_bruteforce_deduplicated(base_board, candidates, idx + 1, placed, results, baseline, max_results, trial_count, first_chain_top, seen_hashes);
                 placed.pop();
                 
                 if results.len() >= max_results {
                     return; // 上限到達で打ち切り
                 }
             }
-        }
-        
-        vlog!("  [総当たり] dfs開始: candidates.len()={}", candidates.len());
-        
-        let mut placed = Vec::new();
-        dfs(base_board, candidates, 0, &mut placed, &mut results, baseline, max_results, &mut trial_count, first_chain_top);
-        
-        vlog!("  [総当たり] dfs完了: 試行数={}, ベースライン超え={} 件", trial_count, results.len());
-        
-        results
     }
 
     fn cp_extend_head(&mut self) {
@@ -1546,6 +1653,23 @@ impl App {
     }
 
     fn draw_chainplay_controls(&mut self, ui: &mut egui::Ui) {
+        // CPU機能検出（初回のみ）
+        static CPU_INFO_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !CPU_INFO_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                let bmi2 = std::is_x86_feature_detected!("bmi2");
+                let popcnt = std::is_x86_feature_detected!("popcnt");
+                self.push_log(format!("CPU最適化: BMI2={} / POPCNT={}", 
+                    if bmi2 { "有効" } else { "無効" },
+                    if popcnt { "有効" } else { "無効" }
+                ));
+                if bmi2 {
+                    self.push_log("ビットボード処理が高速化されています".to_string());
+                }
+            }
+        }
+        
         ui.group(|ui| {
             ui.label("連鎖生成 — 操作");
             let cur = self.cp_current_pair();

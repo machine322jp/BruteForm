@@ -1,4 +1,5 @@
 use crate::constants::{W, H};
+use crate::search::board::{fall_cols_fast, pack_cols};
 
 /// 追加配置の世代(イテレーション)識別子
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,16 +29,55 @@ pub fn get_color(cell: Option<CellData>) -> Option<u8> {
     cell.map(|c| c.color)
 }
 
+/// 重力適用（ビットボード最適化版）
 pub fn apply_gravity(board: &mut Board) {
-    // y=0 が底。底から上へ集め、底から上へ詰める
+    // Boardをcols形式に変換
+    let cols = board_to_cols(board);
+    
+    // BMI2最適化された落下処理を適用
+    let fallen = fall_cols_fast(&cols);
+    
+    // 結果をBoard形式に戻す（元の位置情報を保持）
+    apply_fallen_to_board(board, &cols, &fallen);
+}
+
+/// 落下後の盤面をBoardに反映（元の位置情報を保持）
+fn apply_fallen_to_board(board: &mut Board, old_cols: &[[u16; W]; 4], new_cols: &[[u16; W]; 4]) {
+    // 各列で落下前後の対応を追跡
     for x in 0..W {
-        let mut stack: Vec<CellData> = Vec::with_capacity(H);
-        for y in 0..H { // bottom -> top
-            if let Some(c) = board[y][x] { stack.push(c); }
+        // 各色のセルを集める
+        let mut cells_by_color: [Vec<CellData>; 4] = [
+            Vec::new(), Vec::new(), Vec::new(), Vec::new()
+        ];
+        
+        // 落下前のセルを色ごとに集める（下から上へ）
+        for y in 0..H {
+            if let Some(cell) = board[y][x] {
+                cells_by_color[cell.color as usize].push(cell);
+            }
         }
-        let mut it = stack.into_iter();
-        for y in 0..H { // bottom -> top
-            board[y][x] = it.next();
+        
+        // 列をクリア
+        for y in 0..H {
+            board[y][x] = None;
+        }
+        
+        // 落下後の位置にセルを配置
+        for color in 0..4 {
+            let mut bits = new_cols[color][x];
+            let mut cell_idx = 0;
+            let mut y = 0usize;
+            
+            while bits != 0 {
+                if bits & 1 != 0 {
+                    if cell_idx < cells_by_color[color].len() {
+                        board[y][x] = Some(cells_by_color[color][cell_idx]);
+                        cell_idx += 1;
+                    }
+                }
+                bits >>= 1;
+                y += 1;
+            }
         }
     }
 }
@@ -78,7 +118,23 @@ pub fn get_connected_cells(board: &Board, sx: usize, sy: usize) -> Vec<(usize, u
     out
 }
 
+/// 4個以上の連結グループを検出（ビットボード最適化版）
 pub fn find_groups_4plus(board: &Board) -> Vec<Vec<(usize,usize)>> {
+    // 高速事前チェック：ビットボードで各色の個数を確認
+    let cols = board_to_cols(board);
+    let bb = pack_cols(&cols);
+    
+    // どの色も4個未満なら早期リターン
+    let has_potential = (bb[0].count_ones() >= 4)
+        || (bb[1].count_ones() >= 4)
+        || (bb[2].count_ones() >= 4)
+        || (bb[3].count_ones() >= 4);
+    
+    if !has_potential {
+        return Vec::new();
+    }
+    
+    // 4個以上の色がある場合、詳細な連結判定を行う
     let mut vis = vec![vec![false; W]; H];
     let mut found = Vec::new();
     for y in 0..H {
