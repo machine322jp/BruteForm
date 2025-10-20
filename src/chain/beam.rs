@@ -85,7 +85,7 @@ fn try_extended_cleanup_arrangement(
     blocked_columns: Option<&HashSet<usize>>,
     previous_additions: Option<&HashMap<(usize,usize), CellData>>,
     last_iteration_added_cols: &[usize], // 前回のイテレーションで追加した列
-) -> Vec<(i32, Board, u8)> {
+) -> Vec<(i32, Board, u8, Option<usize>)> { // 戻り値にブロックした列を追加
     const LOG_BEAM_VERBOSE: bool = false;
     vlog!("  [拡張] 追撃探索開始: iter={}", iteration);
     let leftover_field = simulate_chain_without_mapping(pre_chain_field);
@@ -162,14 +162,17 @@ fn try_extended_cleanup_arrangement(
     let mut groups_sorted = candidate_groups;
     groups_sorted.sort_by(|a,b| b.0.cmp(&a.0));
 
-    let mut successful_candidates: Vec<(i32, Board, u8)> = Vec::new();
+    let mut successful_candidates: Vec<(i32, Board, u8, Option<usize>)> = Vec::new();
+    
+    // iteration=2で前回追加した列から最も遠い列を計算（一度だけ）
+    let mut newly_blocked_col: Option<usize> = None;
 
     for (seed_chain, puyo_a_group, _seed_col, target_color, _seed_pos) in groups_sorted.into_iter() {
         vlog!("    [拡張] A対象色={} を試行", color_name(target_color));
 
         // iteration=2以降で、前回追加した列がある場合、Aグループから最も遠い列を1つブロック
         let mut dynamic_blocked = blocked_columns.map(|b| b.clone()).unwrap_or_else(|| HashSet::new());
-        if iteration == 2 && !last_iteration_added_cols.is_empty() {
+        if iteration == 2 && !last_iteration_added_cols.is_empty() && newly_blocked_col.is_none() {
             // Aグループの各セルから各列までの最小距離を計算
             let mut col_distances: Vec<(usize, i32)> = Vec::new();
             for &col in last_iteration_added_cols {
@@ -183,8 +186,12 @@ fn try_extended_cleanup_arrangement(
             // 最も遠い列を選択
             if let Some(&(farthest_col, dist)) = col_distances.iter().max_by_key(|(_, d)| d) {
                 dynamic_blocked.insert(farthest_col);
+                newly_blocked_col = Some(farthest_col);
                 vlog!("    [拡張] Aグループから最も遠い列{}をブロック（距離={}）", farthest_col, dist);
             }
+        } else if iteration == 2 && newly_blocked_col.is_some() {
+            // 既にブロック列が決定済みの場合は、それを使用
+            dynamic_blocked.insert(newly_blocked_col.unwrap());
         }
 
         let candidates = generator.find_best_arrangement(
@@ -405,7 +412,7 @@ fn try_extended_cleanup_arrangement(
                 vlog!("         採用理由: 全チェックを通過（leftover+追加で連鎖成立 / pre_chain+追加で連鎖成立 / C隣接なし）");
             }
             if LOG_CANDIDATE_DETAIL { vlog!("========== 候補 {}/{} の評価終了（✅採用） ==========\n", cand_idx + 1, total_candidates); }
-            successful_candidates.push((new_chain_candidate, merged_field_candidate, target_color));
+            successful_candidates.push((new_chain_candidate, merged_field_candidate, target_color, newly_blocked_col));
             color_accepted = true;
             break 'candidate_loop; // この色では最初の成功候補のみ採用
         }
@@ -488,14 +495,19 @@ pub fn iterative_chain_clearing(
                 next_beam.push(state);
             } else {
                 any_extended = true;
-                for (new_chain, candidate, used_color) in candidates {
+                for (new_chain, candidate, used_color, newly_blocked) in candidates {
                     let new_add = extract_additions(&candidate, &state.field);
                     let accum = add_accumulated(&state.acc_adds, &new_add);
                     let add_sum: usize = new_add.iter().map(|v| v.len()).sum();
                     let add_cols: Vec<_> = new_add.iter().enumerate().filter(|(_, v)| !v.is_empty()).map(|(i, _)| i).collect();
                     vlog!("    [展開結果] it={} 追加={}個 / 列={:?} / 色={} / new_chain={}", 
                              it, add_sum, add_cols, color_name(used_color), new_chain);
-                    let blk = state.blocked_cols.clone();
+                    let mut blk = state.blocked_cols.clone();
+                    // iteration 2で新たにブロックした列を追加
+                    if let Some(col) = newly_blocked {
+                        blk.insert(col);
+                        vlog!("    [ブロック] iteration {} で列 {} を追加ブロック（合計 {} 列）", it, col, blk.len());
+                    }
                     // iteration 1で追加した列を記録（iteration 2でAグループに基づいてブロック判定）
                     let next_last_added_cols = if it == 1 { add_cols.clone() } else { state.last_added_cols.clone() };
                     let mut new_prev = HashMap::new();
