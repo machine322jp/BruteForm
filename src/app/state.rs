@@ -60,7 +60,7 @@ impl Default for App {
             log_lines: vec!["待機中".into()],
             mode: Mode::BruteForce,
             cp: ChainPlay::default(),
-            verbose_logging: false,
+            verbose_logging: false,  // デフォルトでログ出力オフ
         }
     }
 }

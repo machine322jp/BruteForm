@@ -513,7 +513,14 @@ impl Detector {
         let mut puyo_a: BTreeSet<(usize,usize)> = BTreeSet::new();
         for g in &adj_groups { for &p in g { puyo_a.insert(p); } }
         let mut adjacency_base: HashSet<(usize,usize)> = puyo_a.iter().copied().collect();
+        
+        // 許可列: 基点の列とその左右、および隣接グループの列とその左右
         let mut allowed_cols: HashSet<usize> = HashSet::new();
+        // 基点の列とその左右を追加
+        allowed_cols.insert(x);
+        if x > 0 { allowed_cols.insert(x-1); }
+        if x + 1 < W { allowed_cols.insert(x+1); }
+        // 隣接グループの各セルの列とその左右を追加
         for &(cx, _cy) in &adjacency_base {
             allowed_cols.insert(cx);
             if cx > 0 { allowed_cols.insert(cx-1); }

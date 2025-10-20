@@ -131,6 +131,31 @@ fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 初回起動時にverbose loggingの状態を同期
+        static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !INITIALIZED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // ログファイルを初期化（カレントディレクトリに出力）
+            let log_path = "debug_log.txt";
+            
+            // カレントディレクトリを取得して絶対パスを構築
+            let full_path = std::env::current_dir()
+                .ok()
+                .and_then(|p| Some(p.join(log_path)))
+                .unwrap_or_else(|| std::path::PathBuf::from(log_path));
+            
+            if let Err(e) = crate::logging::init_log_file(log_path) {
+                eprintln!("ログファイルの初期化に失敗: {}", e);
+            } else {
+                println!("デバッグログを {} に出力します", full_path.display());
+            }
+            
+            if self.verbose_logging {
+                crate::logging::enable_verbose_logging();
+            } else {
+                crate::logging::disable_verbose_logging();
+            }
+        }
+        
         if self.mode == Mode::ChainPlay {
             self.cp_step_animation();
         }
@@ -1594,9 +1619,9 @@ impl App {
                     }
                 }
                 if self.verbose_logging {
-                    ui.label(RichText::new("（標準出力に詳細ログを出力）").small().color(egui::Color32::GRAY));
+                    ui.label(RichText::new("（debug_log.txt に詳細ログを出力）").small().color(egui::Color32::GRAY));
                 } else {
-                    ui.label(RichText::new("（標準出力を抑制して高速化）").small().color(egui::Color32::GRAY));
+                    ui.label(RichText::new("（ログ出力を抑制して高速化）").small().color(egui::Color32::GRAY));
                 }
             });
             ui.horizontal(|ui| {
