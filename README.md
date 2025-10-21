@@ -13,7 +13,7 @@
 - **Rust**: 1.70以上推奨
 
 ```bash
-cargo run --release --bin puyo_gui
+cargo run --release
 ```
 
 ## 機能詳細
