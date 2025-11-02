@@ -1,8 +1,8 @@
 // LRUキャッシュ
 
-use std::collections::VecDeque;
 use crate::constants::U64Map;
 use nohash_hasher::BuildNoHashHasher;
+use std::collections::VecDeque;
 
 /// 近似LRU（ローカル専用）
 pub struct ApproxLru {
@@ -14,10 +14,8 @@ pub struct ApproxLru {
 impl ApproxLru {
     pub fn new(limit: usize) -> Self {
         let cap = (limit.saturating_mul(11) / 10).max(16);
-        let map: U64Map<bool> = std::collections::HashMap::with_capacity_and_hasher(
-            cap,
-            BuildNoHashHasher::default(),
-        );
+        let map: U64Map<bool> =
+            std::collections::HashMap::with_capacity_and_hasher(cap, BuildNoHashHasher::default());
         let q = VecDeque::with_capacity(cap);
         Self { limit, map, q }
     }

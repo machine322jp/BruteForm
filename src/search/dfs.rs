@@ -1,18 +1,24 @@
 // DFS探索ロジック
 
-use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::time::{Duration, Instant};
-use crossbeam_channel::Sender;
-use crate::constants::{W, H, U64Set, DU64Set, DU64Map};
 use crate::app::{Message, StatDelta};
-use crate::profiling::{TimeDelta, time_delta_has_any};
-use crate::search::coloring::{ColGen, stream_column_candidates, stream_column_candidates_timed};
-use crate::search::board::{assign_col_unrolled, clear_col_unrolled, any_color_has_four};
-use crate::search::hash::{canonical_hash64_fast, encode_canonical_string, serialize_board_from_cols, fnv1a32, make_json_line_str};
-use crate::search::pruning::reaches_t_from_pre_single_e1;
-use crate::search::lru::ApproxLru;
+use crate::constants::{DU64Map, DU64Set, U64Set, H, W};
 use crate::prof;
+use crate::profiling::{time_delta_has_any, TimeDelta};
+use crate::search::board::{any_color_has_four, assign_col_unrolled, clear_col_unrolled};
+use crate::search::coloring::{stream_column_candidates, stream_column_candidates_timed, ColGen};
+use crate::search::hash::{
+    canonical_hash64_fast, encode_canonical_string, fnv1a32, make_json_line_str,
+    serialize_board_from_cols,
+};
+use crate::search::lru::ApproxLru;
+use crate::search::pruning::reaches_t_from_pre_single_e1;
+use crossbeam_channel::Sender;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 #[allow(clippy::too_many_arguments)]
 pub fn dfs_combine_parallel(
@@ -82,19 +88,37 @@ pub fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].memo_miss += 1;
         }
         *mmiss_batch += 1;
-        let reached = prof!(profile_enabled, time_batch.dfs_times[depth].leaf_memo_miss_compute, {
-            reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only)
-        });
+        let reached = prof!(
+            profile_enabled,
+            time_batch.dfs_times[depth].leaf_memo_miss_compute,
+            { reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only) }
+        );
         if !reached {
             if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-                && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+                && (*nodes_batch > 0
+                    || *leaves_batch > 0
+                    || *outputs_batch > 0
+                    || *pruned_batch > 0
+                    || *lhit_batch > 0
+                    || *ghit_batch > 0
+                    || *mmiss_batch > 0)
             {
                 let _ = stat_sender.send(StatDelta {
-                    nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch,
-                    pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch,
+                    nodes: *nodes_batch,
+                    leaves: *leaves_batch,
+                    outputs: *outputs_batch,
+                    pruned: *pruned_batch,
+                    lhit: *lhit_batch,
+                    ghit: *ghit_batch,
+                    mmiss: *mmiss_batch,
                 });
-                *nodes_batch = 0; *leaves_batch = 0; *outputs_batch = 0; *pruned_batch = 0;
-                *lhit_batch = 0; *ghit_batch = 0; *mmiss_batch = 0;
+                *nodes_batch = 0;
+                *leaves_batch = 0;
+                *outputs_batch = 0;
+                *pruned_batch = 0;
+                *lhit_batch = 0;
+                *ghit_batch = 0;
+                *mmiss_batch = 0;
 
                 if profile_enabled && time_delta_has_any(time_batch) {
                     let td = time_batch.clone();
@@ -132,12 +156,23 @@ pub fn dfs_combine_parallel(
                     *last_preview = Instant::now();
                 }
 
-                let line = prof!(profile_enabled, time_batch.dfs_times[depth].out_serialize, {
-                    let key_str = encode_canonical_string(&pre, mirror);
-                    let hash = fnv1a32(&key_str);
-                    let rows = serialize_board_from_cols(&pre);
-                    make_json_line_str(&key_str, hash, threshold, &rows, map_label_to_color, mirror)
-                });
+                let line = prof!(
+                    profile_enabled,
+                    time_batch.dfs_times[depth].out_serialize,
+                    {
+                        let key_str = encode_canonical_string(&pre, mirror);
+                        let hash = fnv1a32(&key_str);
+                        let rows = serialize_board_from_cols(&pre);
+                        make_json_line_str(
+                            &key_str,
+                            hash,
+                            threshold,
+                            &rows,
+                            map_label_to_color,
+                            mirror,
+                        )
+                    }
+                );
                 batch.push(line);
                 *outputs_batch += 1;
 
@@ -149,14 +184,30 @@ pub fn dfs_combine_parallel(
         }
 
         if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-            && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+            && (*nodes_batch > 0
+                || *leaves_batch > 0
+                || *outputs_batch > 0
+                || *pruned_batch > 0
+                || *lhit_batch > 0
+                || *ghit_batch > 0
+                || *mmiss_batch > 0)
         {
             let _ = stat_sender.send(StatDelta {
-                nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch,
-                pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch,
+                nodes: *nodes_batch,
+                leaves: *leaves_batch,
+                outputs: *outputs_batch,
+                pruned: *pruned_batch,
+                lhit: *lhit_batch,
+                ghit: *ghit_batch,
+                mmiss: *mmiss_batch,
             });
-            *nodes_batch = 0; *leaves_batch = 0; *outputs_batch = 0; *pruned_batch = 0;
-            *lhit_batch = 0; *ghit_batch = 0; *mmiss_batch = 0;
+            *nodes_batch = 0;
+            *leaves_batch = 0;
+            *outputs_batch = 0;
+            *pruned_batch = 0;
+            *lhit_batch = 0;
+            *ghit_batch = 0;
+            *mmiss_batch = 0;
 
             if profile_enabled && time_delta_has_any(time_batch) {
                 let td = time_batch.clone();
@@ -179,11 +230,30 @@ pub fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].pruned_upper += 1;
         }
         if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-            && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+            && (*nodes_batch > 0
+                || *leaves_batch > 0
+                || *outputs_batch > 0
+                || *pruned_batch > 0
+                || *lhit_batch > 0
+                || *ghit_batch > 0
+                || *mmiss_batch > 0)
         {
-            let _ = stat_sender.send(StatDelta { nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch, pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch });
-            *nodes_batch = 0; *leaves_batch = 0; *outputs_batch = 0; *pruned_batch = 0;
-            *lhit_batch = 0; *ghit_batch = 0; *mmiss_batch = 0;
+            let _ = stat_sender.send(StatDelta {
+                nodes: *nodes_batch,
+                leaves: *leaves_batch,
+                outputs: *outputs_batch,
+                pruned: *pruned_batch,
+                lhit: *lhit_batch,
+                ghit: *ghit_batch,
+                mmiss: *mmiss_batch,
+            });
+            *nodes_batch = 0;
+            *leaves_batch = 0;
+            *outputs_batch = 0;
+            *pruned_batch = 0;
+            *lhit_batch = 0;
+            *ghit_batch = 0;
+            *mmiss_batch = 0;
 
             if profile_enabled && time_delta_has_any(time_batch) {
                 let td = time_batch.clone();
@@ -209,13 +279,37 @@ pub fn dfs_combine_parallel(
                 });
                 let add = (0..4).map(|c| masks[c].count_ones()).sum::<u32>();
                 let _ = dfs_combine_parallel(
-                    depth + 1, cols0, gens, order, threshold, exact_four_only,
-                    _memo, local_output_once, global_output_once, _global_memo,
-                    map_label_to_color, batch, batch_sender, stat_sender,
-                    profile_enabled, time_batch, nodes_batch, leaves_batch,
-                    outputs_batch, pruned_batch, lhit_batch, ghit_batch, mmiss_batch,
-                    preview_ok, preview_tx, last_preview, _lru_limit, t0, abort,
-                    placed_total + add, remain_suffix,
+                    depth + 1,
+                    cols0,
+                    gens,
+                    order,
+                    threshold,
+                    exact_four_only,
+                    _memo,
+                    local_output_once,
+                    global_output_once,
+                    _global_memo,
+                    map_label_to_color,
+                    batch,
+                    batch_sender,
+                    stat_sender,
+                    profile_enabled,
+                    time_batch,
+                    nodes_batch,
+                    leaves_batch,
+                    outputs_batch,
+                    pruned_batch,
+                    lhit_batch,
+                    ghit_batch,
+                    mmiss_batch,
+                    preview_ok,
+                    preview_tx,
+                    last_preview,
+                    _lru_limit,
+                    t0,
+                    abort,
+                    placed_total + add,
+                    remain_suffix,
                 );
                 clear_col_unrolled(cols0, x);
             }
@@ -235,13 +329,37 @@ pub fn dfs_combine_parallel(
 
                     let add = (0..4).map(|c| masks[c].count_ones()).sum::<u32>();
                     let _ = dfs_combine_parallel(
-                        depth + 1, cols0, gens, order, threshold, exact_four_only,
-                        _memo, local_output_once, global_output_once, _global_memo,
-                        map_label_to_color, batch, batch_sender, stat_sender,
-                        profile_enabled, time_batch, nodes_batch, leaves_batch,
-                        outputs_batch, pruned_batch, lhit_batch, ghit_batch, mmiss_batch,
-                        preview_ok, preview_tx, last_preview, _lru_limit, t0, abort,
-                        placed_total + add, remain_suffix,
+                        depth + 1,
+                        cols0,
+                        gens,
+                        order,
+                        threshold,
+                        exact_four_only,
+                        _memo,
+                        local_output_once,
+                        global_output_once,
+                        _global_memo,
+                        map_label_to_color,
+                        batch,
+                        batch_sender,
+                        stat_sender,
+                        profile_enabled,
+                        time_batch,
+                        nodes_batch,
+                        leaves_batch,
+                        outputs_batch,
+                        pruned_batch,
+                        lhit_batch,
+                        ghit_batch,
+                        mmiss_batch,
+                        preview_ok,
+                        preview_tx,
+                        last_preview,
+                        _lru_limit,
+                        t0,
+                        abort,
+                        placed_total + add,
+                        remain_suffix,
                     );
                     clear_col_unrolled(cols0, x);
                 });
@@ -254,13 +372,37 @@ pub fn dfs_combine_parallel(
                     assign_col_unrolled(cols0, x, &masks);
                     let add = (0..4).map(|c| masks[c].count_ones()).sum::<u32>();
                     let _ = dfs_combine_parallel(
-                        depth + 1, cols0, gens, order, threshold, exact_four_only,
-                        _memo, local_output_once, global_output_once, _global_memo,
-                        map_label_to_color, batch, batch_sender, stat_sender,
-                        profile_enabled, time_batch, nodes_batch, leaves_batch,
-                        outputs_batch, pruned_batch, lhit_batch, ghit_batch, mmiss_batch,
-                        preview_ok, preview_tx, last_preview, _lru_limit, t0, abort,
-                        placed_total + add, remain_suffix,
+                        depth + 1,
+                        cols0,
+                        gens,
+                        order,
+                        threshold,
+                        exact_four_only,
+                        _memo,
+                        local_output_once,
+                        global_output_once,
+                        _global_memo,
+                        map_label_to_color,
+                        batch,
+                        batch_sender,
+                        stat_sender,
+                        profile_enabled,
+                        time_batch,
+                        nodes_batch,
+                        leaves_batch,
+                        outputs_batch,
+                        pruned_batch,
+                        lhit_batch,
+                        ghit_batch,
+                        mmiss_batch,
+                        preview_ok,
+                        preview_tx,
+                        last_preview,
+                        _lru_limit,
+                        t0,
+                        abort,
+                        placed_total + add,
+                        remain_suffix,
                     );
                     clear_col_unrolled(cols0, x);
                 });

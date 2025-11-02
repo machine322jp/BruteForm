@@ -1,7 +1,7 @@
 // 統計・メッセージ型定義
 
-use crate::profiling::{ProfileTotals, TimeDelta};
 use crate::constants::W;
+use crate::profiling::{ProfileTotals, TimeDelta};
 use num_bigint::BigUint;
 
 /// 探索進捗統計

@@ -1,11 +1,13 @@
 // 連鎖検出/生成ロジック（Python zenkesi.py の移植）
 
-pub mod grid;
+pub mod beam;
 pub mod detector;
 pub mod generator;
-pub mod beam;
+pub mod grid;
 
-pub use beam::{compute_target_from_actual, compute_target_from_actual_with_params, iterative_chain_clearing};
+pub use beam::{
+    compute_target_from_actual, compute_target_from_actual_with_params, iterative_chain_clearing,
+};
 pub use detector::{ChainStep, Detector};
-pub use grid::{Board, CellData, IterId, cols_to_board, board_to_cols, apply_gravity};
 pub use generator::Generator;
+pub use grid::{apply_gravity, board_to_cols, cols_to_board, Board, CellData, IterId};

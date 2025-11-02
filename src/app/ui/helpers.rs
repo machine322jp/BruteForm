@@ -1,16 +1,16 @@
 // UI描画用のヘルパー関数
 
-use egui::{Color32, RichText, Vec2};
-use crate::constants::{W, H};
+use crate::constants::{H, W};
 use crate::model::cell_style;
-use crate::profiling::{ProfileTotals, fmt_dur_ms};
+use crate::profiling::{fmt_dur_ms, ProfileTotals};
+use egui::{Color32, RichText, Vec2};
 
 /// カラーパレット（4色のぷよ）
 pub const COLOR_PALETTE: [Color32; 4] = [
-    Color32::from_rgb(239, 68, 68),   // red
-    Color32::from_rgb(34, 197, 94),   // green
-    Color32::from_rgb(59, 130, 246),  // blue
-    Color32::from_rgb(234, 179, 8),   // yellow
+    Color32::from_rgb(239, 68, 68),  // red
+    Color32::from_rgb(34, 197, 94),  // green
+    Color32::from_rgb(59, 130, 246), // blue
+    Color32::from_rgb(234, 179, 8),  // yellow
 ];
 
 /// ペアプレビューの描画
@@ -73,47 +73,53 @@ pub fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
 
 /// プロファイル表示
 pub fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
-    ui.monospace(format!("I/O 書き込み合計: {}", fmt_dur_ms(p.io_write_total)));
+    ui.monospace(format!(
+        "I/O 書き込み合計: {}",
+        fmt_dur_ms(p.io_write_total)
+    ));
     ui.add_space(4.0);
-    egui::Grid::new("profile-grid").striped(true).num_columns(16).show(ui, |ui| {
-        ui.monospace("深さ");
-        ui.monospace("nodes");
-        ui.monospace("cand");
-        ui.monospace("pruned");
-        ui.monospace("leaves");
-        ui.monospace("pre_thres");
-        ui.monospace("pre_e1ng");
-        ui.monospace("L-hit");
-        ui.monospace("G-hit");
-        ui.monospace("Miss");
-        ui.monospace("gen");
-        ui.monospace("assign");
-        ui.monospace("upper");
-        ui.monospace("hash");
-        ui.monospace("reach");
-        ui.monospace("serial");
-        ui.end_row();
-
-        for d in 0..=W {
-            let t = p.dfs_times[d];
-            let c = p.dfs_counts[d];
-            ui.monospace(format!("{}", d));
-            ui.monospace(format!("{}", c.nodes));
-            ui.monospace(format!("{}", c.cand_generated));
-            ui.monospace(format!("{}", c.pruned_upper));
-            ui.monospace(format!("{}", c.leaves));
-            ui.monospace(format!("{}", c.leaf_pre_tshort));
-            ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
-            ui.monospace(format!("{}", c.memo_lhit));
-            ui.monospace(format!("{}", c.memo_ghit));
-            ui.monospace(format!("{}", c.memo_miss));
-            ui.monospace(fmt_dur_ms(t.gen_candidates));
-            ui.monospace(fmt_dur_ms(t.assign_cols));
-            ui.monospace(fmt_dur_ms(t.upper_bound));
-            ui.monospace(fmt_dur_ms(t.leaf_hash));
-            ui.monospace(fmt_dur_ms(t.leaf_memo_miss_compute));
-            ui.monospace(fmt_dur_ms(t.out_serialize));
+    egui::Grid::new("profile-grid")
+        .striped(true)
+        .num_columns(16)
+        .show(ui, |ui| {
+            ui.monospace("深さ");
+            ui.monospace("nodes");
+            ui.monospace("cand");
+            ui.monospace("pruned");
+            ui.monospace("leaves");
+            ui.monospace("pre_thres");
+            ui.monospace("pre_e1ng");
+            ui.monospace("L-hit");
+            ui.monospace("G-hit");
+            ui.monospace("Miss");
+            ui.monospace("gen");
+            ui.monospace("assign");
+            ui.monospace("upper");
+            ui.monospace("hash");
+            ui.monospace("reach");
+            ui.monospace("serial");
             ui.end_row();
-        }
-    });
+
+            for d in 0..=W {
+                let t = p.dfs_times[d];
+                let c = p.dfs_counts[d];
+                ui.monospace(format!("{}", d));
+                ui.monospace(format!("{}", c.nodes));
+                ui.monospace(format!("{}", c.cand_generated));
+                ui.monospace(format!("{}", c.pruned_upper));
+                ui.monospace(format!("{}", c.leaves));
+                ui.monospace(format!("{}", c.leaf_pre_tshort));
+                ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
+                ui.monospace(format!("{}", c.memo_lhit));
+                ui.monospace(format!("{}", c.memo_ghit));
+                ui.monospace(format!("{}", c.memo_miss));
+                ui.monospace(fmt_dur_ms(t.gen_candidates));
+                ui.monospace(fmt_dur_ms(t.assign_cols));
+                ui.monospace(fmt_dur_ms(t.upper_bound));
+                ui.monospace(fmt_dur_ms(t.leaf_hash));
+                ui.monospace(fmt_dur_ms(t.leaf_memo_miss_compute));
+                ui.monospace(fmt_dur_ms(t.out_serialize));
+                ui.end_row();
+            }
+        });
 }

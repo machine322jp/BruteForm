@@ -1,25 +1,28 @@
 // 探索エンジン
 
+use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::{unbounded, Sender};
+use nohash_hasher::BuildNoHashHasher;
+use num_bigint::BigUint;
+use num_traits::{One, ToPrimitive, Zero};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
-use anyhow::{Result, Context, anyhow};
-use crossbeam_channel::{Sender, unbounded};
-use rayon::prelude::*;
-use num_bigint::BigUint;
-use num_traits::{One, Zero, ToPrimitive};
-use nohash_hasher::BuildNoHashHasher;
 
-use crate::constants::{W, H, U64Set, DU64Set, DU64Map};
-use crate::app::{Stats, Message, StatDelta};
-use crate::profiling::{ProfileTotals, TimeDelta, time_delta_has_any};
+use crate::app::{Message, StatDelta, Stats};
+use crate::constants::{DU64Map, DU64Set, U64Set, H, W};
+use crate::profiling::{time_delta_has_any, ProfileTotals, TimeDelta};
 use crate::search::coloring::*;
-use crate::search::lru::{ApproxLru, array_init};
 use crate::search::dfs::dfs_combine_parallel;
+use crate::search::lru::{array_init, ApproxLru};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_search(
@@ -55,7 +58,8 @@ pub fn run_search(
         let bmi2 = std::is_x86_feature_detected!("bmi2");
         let popcnt = std::is_x86_feature_detected!("popcnt");
         let _ = tx.send(Message::Log(format!(
-            "CPU features: bmi2={} / popcnt={}", bmi2, popcnt
+            "CPU features: bmi2={} / popcnt={}",
+            bmi2, popcnt
         )));
     }
 
@@ -135,8 +139,10 @@ pub fn run_search(
     let tx_progress = tx.clone();
     let total_clone = total.clone();
     let abort_for_agg = abort.clone();
-    let global_output_once: Arc<DU64Set> = Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
-    let global_memo: Arc<DU64Map<bool>> = Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
+    let global_output_once: Arc<DU64Set> =
+        Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
+    let global_memo: Arc<DU64Map<bool>> =
+        Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
 
     let global_memo_for_agg = global_memo.clone();
     let lru_limit_for_agg = lru_limit;
@@ -246,10 +252,8 @@ pub fn run_search(
     });
 
     // 並列探索
-    metas
-        .par_iter()
-        .enumerate()
-        .try_for_each(|(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
+    metas.par_iter().enumerate().try_for_each(
+        |(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
             if abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -281,7 +285,8 @@ pub fn run_search(
                         for c in 0..4 {
                             cols0[c][first_x] = masks[c];
                         }
-                        let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                        let mut memo =
+                            ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                         let mut local_output_once: U64Set = U64Set::default();
                         let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -297,20 +302,59 @@ pub fn run_search(
 
                         let placed_first: u32 = (0..4).map(|c| masks[c].count_ones()).sum();
                         let _ = dfs_combine_parallel(
-                            1, &mut cols0, gens, order, threshold, exact_four_only,
-                            &mut memo, &mut local_output_once, &global_output_once, &global_memo,
-                            map_label_to_color, &mut batch, &wtx, &stx, profile_enabled,
-                            &mut time_batch, &mut nodes_batch, &mut leaves_batch,
-                            &mut outputs_batch, &mut pruned_batch, &mut lhit_batch,
-                            &mut ghit_batch, &mut mmiss_batch, preview_ok, &tx,
-                            &mut last_preview, lru_limit, t0, &abort, placed_first, &remain_suffix,
+                            1,
+                            &mut cols0,
+                            gens,
+                            order,
+                            threshold,
+                            exact_four_only,
+                            &mut memo,
+                            &mut local_output_once,
+                            &global_output_once,
+                            &global_memo,
+                            map_label_to_color,
+                            &mut batch,
+                            &wtx,
+                            &stx,
+                            profile_enabled,
+                            &mut time_batch,
+                            &mut nodes_batch,
+                            &mut leaves_batch,
+                            &mut outputs_batch,
+                            &mut pruned_batch,
+                            &mut lhit_batch,
+                            &mut ghit_batch,
+                            &mut mmiss_batch,
+                            preview_ok,
+                            &tx,
+                            &mut last_preview,
+                            lru_limit,
+                            t0,
+                            &abort,
+                            placed_first,
+                            &remain_suffix,
                         );
 
                         if !batch.is_empty() {
                             let _ = wtx.send(batch);
                         }
-                        if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                            let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                        if nodes_batch > 0
+                            || leaves_batch > 0
+                            || outputs_batch > 0
+                            || pruned_batch > 0
+                            || lhit_batch > 0
+                            || ghit_batch > 0
+                            || mmiss_batch > 0
+                        {
+                            let _ = stx.send(StatDelta {
+                                nodes: nodes_batch,
+                                leaves: leaves_batch,
+                                outputs: outputs_batch,
+                                pruned: pruned_batch,
+                                lhit: lhit_batch,
+                                ghit: ghit_batch,
+                                mmiss: mmiss_batch,
+                            });
                         }
                         if profile_enabled && time_delta_has_any(&time_batch) {
                             let _ = tx.send(Message::TimeDelta(time_batch));
@@ -343,7 +387,8 @@ pub fn run_search(
                                 cols0[c][first_x] = masks[c];
                                 cols0[c][second_x] = m2[c];
                             }
-                            let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                            let mut memo =
+                                ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                             let mut local_output_once: U64Set = U64Set::default();
                             let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -357,22 +402,63 @@ pub fn run_search(
                             let mut last_preview = Instant::now();
                             let mut time_batch = TimeDelta::default();
 
-                            let placed2: u32 = (0..4).map(|c| masks[c].count_ones() + m2[c].count_ones()).sum();
+                            let placed2: u32 = (0..4)
+                                .map(|c| masks[c].count_ones() + m2[c].count_ones())
+                                .sum();
                             let _ = dfs_combine_parallel(
-                                2, &mut cols0, gens, order, threshold, exact_four_only,
-                                &mut memo, &mut local_output_once, &global_output_once, &global_memo,
-                                map_label_to_color, &mut batch, &wtx, &stx, profile_enabled,
-                                &mut time_batch, &mut nodes_batch, &mut leaves_batch,
-                                &mut outputs_batch, &mut pruned_batch, &mut lhit_batch,
-                                &mut ghit_batch, &mut mmiss_batch, preview_ok, &tx,
-                                &mut last_preview, lru_limit, t0, &abort, placed2, &remain_suffix,
+                                2,
+                                &mut cols0,
+                                gens,
+                                order,
+                                threshold,
+                                exact_four_only,
+                                &mut memo,
+                                &mut local_output_once,
+                                &global_output_once,
+                                &global_memo,
+                                map_label_to_color,
+                                &mut batch,
+                                &wtx,
+                                &stx,
+                                profile_enabled,
+                                &mut time_batch,
+                                &mut nodes_batch,
+                                &mut leaves_batch,
+                                &mut outputs_batch,
+                                &mut pruned_batch,
+                                &mut lhit_batch,
+                                &mut ghit_batch,
+                                &mut mmiss_batch,
+                                preview_ok,
+                                &tx,
+                                &mut last_preview,
+                                lru_limit,
+                                t0,
+                                &abort,
+                                placed2,
+                                &remain_suffix,
                             );
 
                             if !batch.is_empty() {
                                 let _ = wtx.send(batch);
                             }
-                            if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                                let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                            if nodes_batch > 0
+                                || leaves_batch > 0
+                                || outputs_batch > 0
+                                || pruned_batch > 0
+                                || lhit_batch > 0
+                                || ghit_batch > 0
+                                || mmiss_batch > 0
+                            {
+                                let _ = stx.send(StatDelta {
+                                    nodes: nodes_batch,
+                                    leaves: leaves_batch,
+                                    outputs: outputs_batch,
+                                    pruned: pruned_batch,
+                                    lhit: lhit_batch,
+                                    ghit: ghit_batch,
+                                    mmiss: mmiss_batch,
+                                });
                             }
                             if profile_enabled && time_delta_has_any(&time_batch) {
                                 let _ = tx.send(Message::TimeDelta(time_batch));
@@ -382,11 +468,14 @@ pub fn run_search(
                     })?;
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     drop(wtx);
     drop(stx);
-    let writer_result = writer_handle.join().map_err(|_| anyhow!("writer join error"))?;
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer join error"))?;
     writer_result?;
     agg_handle.join().map_err(|_| anyhow!("agg join error"))?;
 

@@ -1,7 +1,7 @@
 // 計測モジュール
 
-use std::time::Duration;
 use crate::constants::W;
+use std::time::Duration;
 
 /// DFS 深さごとの処理時間
 #[derive(Default, Clone, Copy)]

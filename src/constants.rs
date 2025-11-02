@@ -1,7 +1,7 @@
 // 監面定数とユーティリティ型定義
 
-use nohash_hasher::BuildNoHashHasher;
 pub use dashmap::{DashMap, DashSet};
+use nohash_hasher::BuildNoHashHasher;
 
 /// ====== 監面定数 ======
 pub const W: usize = 6;

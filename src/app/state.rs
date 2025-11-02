@@ -1,11 +1,11 @@
 // アプリケーション状態
 
-use std::sync::{Arc, atomic::AtomicBool};
-use crossbeam_channel::Receiver;
-use crate::model::Cell;
-use crate::constants::W;
-use super::{Stats, Message};
 use super::chain_play::ChainPlay;
+use super::{Message, Stats};
+use crate::constants::W;
+use crate::model::Cell;
+use crossbeam_channel::Receiver;
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// 画面モード
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl Default for App {
             log_lines: vec!["待機中".into()],
             mode: Mode::BruteForce,
             cp: ChainPlay::default(),
-            verbose_logging: false,  // デフォルトでログ出力オフ
+            verbose_logging: false, // デフォルトでログ出力オフ
         }
     }
 }

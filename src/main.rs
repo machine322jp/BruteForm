@@ -51,7 +51,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
         let path = fontdir.join(name);
         if let Ok(bytes) = std::fs::read(&path) {
             let key = format!("jp-{}", name.to_lowercase());
-            fonts.font_data.insert(key.clone(), FontData::from_owned(bytes));
+            fonts
+                .font_data
+                .insert(key.clone(), FontData::from_owned(bytes));
             fonts
                 .families
                 .get_mut(&FontFamily::Proportional)
@@ -70,6 +72,8 @@ fn install_japanese_fonts(ctx: &egui::Context) {
     if loaded {
         ctx.set_fonts(fonts);
     } else {
-        eprintln!("日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。");
+        eprintln!(
+            "日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。"
+        );
     }
 }

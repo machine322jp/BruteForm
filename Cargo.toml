@@ -26,6 +26,7 @@ num-traits = "0.2"
 # 並列化・チャネル
 crossbeam-channel = "0.5"
 rayon = "1.10"
+num_cpus = "1.16"
 
 # 高速ハッシュ（u64キー専用）
 nohash-hasher = "0.2"

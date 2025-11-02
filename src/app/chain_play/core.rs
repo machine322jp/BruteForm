@@ -1,8 +1,8 @@
-// 連鎖生成モード関連
+// 連鎖生成モード関連の構造体定義
 
-use std::time::Instant;
-use rand::Rng;
 use crate::constants::W;
+use rand::Rng;
+use std::time::Instant;
 
 /// アニメーション段階
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,10 @@ pub struct ChainPlay {
     // 連鎖検出結果
     pub target_chain_info: Option<Vec<crate::chain::ChainStep>>,
     // 周囲9マスのキャッシュ（1連鎖目と最終連鎖用）
-    pub around_cells_cache: Option<(std::collections::HashSet<(usize, usize)>, std::collections::HashSet<(usize, usize)>)>,
+    pub around_cells_cache: Option<(
+        std::collections::HashSet<(usize, usize)>,
+        std::collections::HashSet<(usize, usize)>,
+    )>,
     // 削除したフリートップの位置（頭伸ばし用）
     pub removed_freetop: Option<(usize, usize)>,
 }
@@ -63,7 +66,10 @@ impl Default for ChainPlay {
             seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
         }
         let cols = [[0u16; W]; 4];
-        let s0 = SavedState { cols, pair_index: 0 };
+        let s0 = SavedState {
+            cols,
+            pair_index: 0,
+        };
         Self {
             cols,
             pair_seq: seq,

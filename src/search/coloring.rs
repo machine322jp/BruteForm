@@ -1,11 +1,11 @@
 // 彩色と列生成ロジック
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use crate::constants::{H, W};
+use crate::model::TCell;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use crate::model::TCell;
-use crate::constants::{W, H};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// 抽象情報（ラベルと隣接関係）
 pub struct AbstractInfo {
@@ -128,7 +128,15 @@ pub fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
                 }
             }
             let next_max_used = if c > max_used { c } else { max_used };
-            dfs(vleft - 1, total_n, adj, color, used_mask, out, next_max_used);
+            dfs(
+                vleft - 1,
+                total_n,
+                adj,
+                color,
+                used_mask,
+                out,
+                next_max_used,
+            );
 
             color[v] = 4;
             let mut t = touched;

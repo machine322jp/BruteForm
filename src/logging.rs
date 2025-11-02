@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// グローバルな詳細ログフラグ
 pub static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
@@ -16,7 +16,7 @@ pub fn init_log_file(path: &str) -> std::io::Result<()> {
         .write(true)
         .truncate(true)
         .open(path)?;
-    
+
     let mut log_file = LOG_FILE.lock().unwrap();
     *log_file = Some(file);
     Ok(())

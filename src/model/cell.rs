@@ -1,38 +1,8 @@
-// セル型定義
+// セル型定義（UI層向けヘルパー）
+// Cell型の本体はdomain::board::cellに移行済み
 
+use crate::domain::board::Cell;
 use egui::Color32;
-
-/// UI で使用するセル型（盤面入力用）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cell {
-    Blank,      // '.'
-    Any,        // 'N' (空白 or 色)
-    Any4,       // 'X' (色のみ)
-    Abs(u8),    // 0..12 = 'A'..'M'
-    Fixed(u8),  // 0..=3 = '0'..'3' (RGBY固定)
-}
-
-/// テンプレート用セル型（探索処理用）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TCell {
-    Blank,
-    Any,
-    Any4,
-    Fixed(u8),
-}
-
-impl Cell {
-    /// セルをラベル文字に変換
-    pub fn label_char(self) -> char {
-        match self {
-            Cell::Blank => '.',
-            Cell::Any => 'N',
-            Cell::Any4 => 'X',
-            Cell::Abs(i) => (b'A' + i) as char,
-            Cell::Fixed(c) => (b'0' + c) as char,
-        }
-    }
-}
 
 /// セルのスタイル情報を取得（表示テキスト、塗りつぶし色、ストローク）
 pub fn cell_style(c: Cell) -> (String, Color32, egui::Stroke) {
@@ -93,28 +63,5 @@ pub fn cell_style(c: Cell) -> (String, Color32, egui::Stroke) {
     }
 }
 
-/// Abs 系のサイクル（A→B→...→M→A）
-pub fn cycle_abs(c: Cell) -> Cell {
-    match c {
-        Cell::Blank | Cell::Any | Cell::Any4 => Cell::Abs(0),
-        Cell::Abs(i) => Cell::Abs(((i as usize + 1) % 13) as u8),
-        Cell::Fixed(_) => Cell::Abs(0),
-    }
-}
-
-/// Any ↔ Any4 のサイクル
-pub fn cycle_any(c: Cell) -> Cell {
-    match c {
-        Cell::Any => Cell::Any4,
-        Cell::Any4 => Cell::Any,
-        _ => Cell::Any,
-    }
-}
-
-/// Fixed のサイクル（R→G→B→Y→R）
-pub fn cycle_fixed(c: Cell) -> Cell {
-    match c {
-        Cell::Fixed(v) => Cell::Fixed(((v as usize + 1) % 4) as u8),
-        _ => Cell::Fixed(0),
-    }
-}
+// cycle関数はドメイン層から再エクスポート
+pub use crate::domain::board::cell::{cycle_abs, cycle_any, cycle_fixed};

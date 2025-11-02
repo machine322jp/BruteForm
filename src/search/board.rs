@@ -1,6 +1,6 @@
 // ビットボード処理
 
-use crate::constants::{W, H, MASK14};
+use crate::constants::{H, MASK14, W};
 
 /// ビットボード型（6×14=84マスを u128 にパック）
 pub type BB = u128;
@@ -119,7 +119,9 @@ pub fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("bmi2") {
-            unsafe { return fall_cols_bmi2(cols_in); }
+            unsafe {
+                return fall_cols_bmi2(cols_in);
+            }
         }
     }
     fall_cols(cols_in)
@@ -128,10 +130,10 @@ pub fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn fall_cols_bmi2(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_pdep_u32, _pext_u32};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{_pdep_u32, _pext_u32};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_pdep_u32, _pext_u32};
 
     let mut out = [[0u16; W]; 4];
 

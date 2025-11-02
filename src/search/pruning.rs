@@ -1,10 +1,9 @@
 // 枝刈りと到達判定
 
-use crate::constants::{W, H, MASK14, BOARD_MASK};
+use crate::constants::{BOARD_MASK, H, MASK14, W};
 use crate::search::board::{
-    BB, pack_cols, unpack_mask_to_cols, fall_cols_fast, 
-    any_color_has_four, apply_erase_and_fall_cols, 
-    apply_erase_and_fall_exact4, StepExact
+    any_color_has_four, apply_erase_and_fall_cols, apply_erase_and_fall_exact4, fall_cols_fast,
+    pack_cols, unpack_mask_to_cols, StepExact, BB,
 };
 
 const COL_BITS: usize = H;
@@ -16,7 +15,7 @@ fn neighbors(bits: BB) -> BB {
     const BOTTOM_MASK: BB = bottom_mask();
     const LEFTCOL_MASK: BB = (1u128 << COL_BITS) - 1;
     const RIGHTCOL_MASK: BB = ((1u128 << COL_BITS) - 1) << ((W - 1) * COL_BITS);
-    
+
     let v_up = (bits & !TOP_MASK) << 1;
     let v_down = (bits & !BOTTOM_MASK) >> 1;
     let h_left = (bits & !LEFTCOL_MASK) >> COL_BITS;

@@ -1,10 +1,10 @@
 // 盤面評価とBFS探索のロジック
 
-use std::collections::{HashSet, VecDeque};
-use crate::constants::{W, H};
 use crate::app::chain_play::Orient;
+use crate::constants::{H, W};
 use crate::search::hash::canonical_hash64_fast;
 use crate::vlog;
+use std::collections::{HashSet, VecDeque};
 
 /// 盤面評価ユーティリティ
 pub struct BoardEvaluator;
@@ -19,7 +19,7 @@ impl BoardEvaluator {
         pair: (u8, u8),
     ) -> i32 {
         let mut test_cols = *actual_cols;
-        
+
         // 配置する2つのぷよの位置と色を記録
         let mut placed_puyos: Vec<(usize, usize, u8)> = Vec::new();
 
@@ -82,7 +82,7 @@ impl BoardEvaluator {
                 score += matched.count_ones() as i32;
             }
         }
-        
+
         // 配置したぷよが目標盤面の別の色を上書きしていないかチェック
         for (px, py, color) in placed_puyos {
             let bit = 1u16 << py;
@@ -98,7 +98,7 @@ impl BoardEvaluator {
                 }
             }
         }
-        
+
         score
     }
 
@@ -128,26 +128,27 @@ impl BoardEvaluator {
             && target_board[1][x] & bit == 0
             && target_board[2][x] & bit == 0
             && target_board[3][x] & bit == 0;
-        
+
         if !is_empty {
             return false;
         }
-        
+
         // 床（y=0）の場合は常にtrue
         if y == 0 {
             return true;
         }
-        
+
         // 下に既存ぷよがあるかチェック
         let bit_below = 1u16 << (y - 1);
         let has_puyo_below = target_board[0][x] & bit_below != 0
             || target_board[1][x] & bit_below != 0
             || target_board[2][x] & bit_below != 0
             || target_board[3][x] & bit_below != 0;
-        
+
         // または下に収集済み空マス/連鎖マスがあるか
-        let has_collected_below = collected.contains(&(x, y - 1)) || chain_cells.contains(&(x, y - 1));
-        
+        let has_collected_below =
+            collected.contains(&(x, y - 1)) || chain_cells.contains(&(x, y - 1));
+
         has_puyo_below || has_collected_below
     }
 
@@ -160,14 +161,14 @@ impl BoardEvaluator {
         let mut result = HashSet::new();
         let mut visited = HashSet::new();
         let mut queue: VecDeque<((usize, usize), usize)> = VecDeque::new(); // (位置, 距離)
-        
+
         // 連鎖マスから開始（距離0）
         for &pos in chain_cells {
             visited.insert(pos);
         }
-        
+
         vlog!("[周囲9マス探索] 連鎖マス数: {}", chain_cells.len());
-        
+
         // 連鎖マスに隣接する配置可能な空マスをキューに追加（距離1）
         for &(cx, cy) in chain_cells {
             let dirs = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)];
@@ -177,22 +178,27 @@ impl BoardEvaluator {
                 if nx >= 0 && nx < W as isize && ny >= 0 && ny < H as isize {
                     let nxu = nx as usize;
                     let nyu = ny as usize;
-                    
+
                     if visited.contains(&(nxu, nyu)) {
                         continue;
                     }
-                    
+
                     // 必ずvisitedに追加（空マスでなくても）
                     visited.insert((nxu, nyu));
-                    
+
                     // 配置可能な空マスかチェック（床または既存ぷよ/収集済みマス/連鎖マスと隣接）
                     if Self::is_placeable_empty(target_board, nxu, nyu, &result, chain_cells) {
                         queue.push_back(((nxu, nyu), 1));
                         result.insert((nxu, nyu));
                         if result.len() <= 20 {
-                            vlog!("[周囲9マス探索] 距離1: ({}, {}) 収集数={}", nxu, nyu, result.len());
+                            vlog!(
+                                "[周囲9マス探索] 距離1: ({}, {}) 収集数={}",
+                                nxu,
+                                nyu,
+                                result.len()
+                            );
                         }
-                        
+
                         if result.len() >= max_count {
                             vlog!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
                             return result;
@@ -201,9 +207,12 @@ impl BoardEvaluator {
                 }
             }
         }
-        
-        vlog!("[周囲9マス探索] 距離1探索完了、キューサイズ={}", queue.len());
-        
+
+        vlog!(
+            "[周囲9マス探索] 距離1探索完了、キューサイズ={}",
+            queue.len()
+        );
+
         // BFSで更に隣接する配置可能な空マスを探索
         let mut iteration_count = 0;
         while let Some(((cx, cy), dist)) = queue.pop_front() {
@@ -212,7 +221,7 @@ impl BoardEvaluator {
                 vlog!("[周囲9マス探索] 警告: 10000回反復、強制終了");
                 break;
             }
-            
+
             let dirs = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)];
             for (dx, dy) in dirs {
                 let nx = cx as isize + dx;
@@ -220,22 +229,28 @@ impl BoardEvaluator {
                 if nx >= 0 && nx < W as isize && ny >= 0 && ny < H as isize {
                     let nxu = nx as usize;
                     let nyu = ny as usize;
-                    
+
                     if visited.contains(&(nxu, nyu)) {
                         continue;
                     }
-                    
+
                     // 必ずvisitedに追加（空マスでなくても）
                     visited.insert((nxu, nyu));
-                    
+
                     // 配置可能な空マスかチェック（床または既存ぷよ/収集済みマス/連鎖マスと隣接）
                     if Self::is_placeable_empty(target_board, nxu, nyu, &result, chain_cells) {
                         queue.push_back(((nxu, nyu), dist + 1));
                         result.insert((nxu, nyu));
                         if result.len() <= 20 {
-                            vlog!("[周囲9マス探索] 距離{}: ({}, {}) 収集数={}", dist + 1, nxu, nyu, result.len());
+                            vlog!(
+                                "[周囲9マス探索] 距離{}: ({}, {}) 収集数={}",
+                                dist + 1,
+                                nxu,
+                                nyu,
+                                result.len()
+                            );
                         }
-                        
+
                         if result.len() >= max_count {
                             vlog!("[周囲9マス探索] 最大{}マス到達、探索終了", max_count);
                             return result;
@@ -244,8 +259,12 @@ impl BoardEvaluator {
                 }
             }
         }
-        
-        vlog!("[周囲9マス探索] 探索完了、収集数={} 反復回数={}", result.len(), iteration_count);
+
+        vlog!(
+            "[周囲9マス探索] 探索完了、収集数={} 反復回数={}",
+            result.len(),
+            iteration_count
+        );
         result
     }
 }

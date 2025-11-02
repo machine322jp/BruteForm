@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::constants::{W, H};
+use crate::constants::{H, W};
 use crate::vlog;
 
 // デバッグログ制御フラグ
-const LOG_CANDIDATE_DETAIL: bool = true;   // 各候補の詳細ログ（盤面表示など）
-const LOG_CANDIDATE_SUMMARY: bool = true;  // 各候補の個別ログ（採用/棄却）
-const LOG_ONLY_ACCEPTED: bool = false;     // 採用された候補のみログ出力
+const LOG_CANDIDATE_DETAIL: bool = true; // 各候補の詳細ログ（盤面表示など）
+const LOG_CANDIDATE_SUMMARY: bool = true; // 各候補の個別ログ（採用/棄却）
+const LOG_ONLY_ACCEPTED: bool = false; // 採用された候補のみログ出力
 
 // 色番号を漢字に変換
 fn color_name(color: u8) -> &'static str {
@@ -18,9 +18,12 @@ fn color_name(color: u8) -> &'static str {
         _ => "?",
     }
 }
-use super::grid::{Board, CellData, IterId, empty_board, apply_gravity, find_bottom_empty, get_connected_cells, cols_to_board, board_to_cols, in_range};
 use super::detector::{Detector, RejectKind};
 use super::generator::Generator;
+use super::grid::{
+    apply_gravity, board_to_cols, cols_to_board, empty_board, find_bottom_empty,
+    get_connected_cells, in_range, Board, CellData, IterId,
+};
 
 #[derive(Clone)]
 struct BeamState {
@@ -28,7 +31,7 @@ struct BeamState {
     acc_chain: i32,
     acc_adds: Vec<Vec<CellData>>, // per column added cells (top-first)
     blocked_cols: HashSet<usize>,
-    prev_adds: HashMap<(usize,usize), CellData>,
+    prev_adds: HashMap<(usize, usize), CellData>,
     iteration: u8,
     last_added_cols: Vec<usize>, // 直前のイテレーションで追加した列のリスト
 }
@@ -37,7 +40,7 @@ fn extract_additions(merged: &Board, base: &Board) -> Vec<Vec<CellData>> {
     let mut adds: Vec<Vec<CellData>> = vec![Vec::new(); W];
     for x in 0..W {
         let mut col_merged: Vec<CellData> = (0..H).filter_map(|y| merged[y][x]).collect(); // bottom->top
-        let mut col_base: Vec<CellData> = (0..H).filter_map(|y| base[y][x]).collect();   // bottom->top
+        let mut col_base: Vec<CellData> = (0..H).filter_map(|y| base[y][x]).collect(); // bottom->top
         let lm = col_merged.len();
         let lb = col_base.len();
         if lm > lb {
@@ -83,9 +86,10 @@ fn try_extended_cleanup_arrangement(
     baseline_chain: i32,
     iteration: u8,
     blocked_columns: Option<&HashSet<usize>>,
-    previous_additions: Option<&HashMap<(usize,usize), CellData>>,
+    previous_additions: Option<&HashMap<(usize, usize), CellData>>,
     last_iteration_added_cols: &[usize], // 前回のイテレーションで追加した列
-) -> Vec<(i32, Board, u8, Option<usize>)> { // 戻り値にブロックした列を追加
+) -> Vec<(i32, Board, u8, Option<usize>)> {
+    // 戻り値にブロックした列を追加
     const LOG_BEAM_VERBOSE: bool = false;
     vlog!("  [拡張] 追撃探索開始: iter={}", iteration);
     let leftover_field = simulate_chain_without_mapping(pre_chain_field);
@@ -124,32 +128,53 @@ fn try_extended_cleanup_arrangement(
     let base_for_seed = &leftover_field;
 
     // ぷよA候補の探索（隣接色からグループ取得）
-    let mut candidate_groups: Vec<(i32, HashSet<(usize,usize)>, usize, u8, (usize,usize))> = Vec::new();
-    let dirs = [(1isize,0isize),(-1,0),(0,1),(0,-1)];
+    let mut candidate_groups: Vec<(i32, HashSet<(usize, usize)>, usize, u8, (usize, usize))> =
+        Vec::new();
+    let dirs = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)];
     for col in 0..W {
-        let Some(empty_y) = find_bottom_empty(base_for_seed, col) else { continue; };
+        let Some(empty_y) = find_bottom_empty(base_for_seed, col) else {
+            continue;
+        };
         let mut neighbor_pos = Vec::new();
-        for (dx,dy) in dirs {
-            let nx = col as isize + dx; let ny = empty_y as isize + dy;
-            if !in_range(nx, ny) { continue; }
-            let nxu = nx as usize; let nyu = ny as usize;
-            if base_for_seed[nyu][nxu].is_some() { neighbor_pos.push((nxu, nyu)); }
+        for (dx, dy) in dirs {
+            let nx = col as isize + dx;
+            let ny = empty_y as isize + dy;
+            if !in_range(nx, ny) {
+                continue;
+            }
+            let nxu = nx as usize;
+            let nyu = ny as usize;
+            if base_for_seed[nyu][nxu].is_some() {
+                neighbor_pos.push((nxu, nyu));
+            }
         }
         for (nx, ny) in neighbor_pos {
             let candidate_color = base_for_seed[ny][nx].unwrap().color;
-            let mut group: HashSet<(usize,usize)> = get_connected_cells(base_for_seed, nx, ny).into_iter().collect();
-            for (dx,dy) in dirs {
-                let ax = col as isize + dx; let ay = empty_y as isize + dy;
-                if !in_range(ax, ay) { continue; }
-                let axu = ax as usize; let ayu = ay as usize;
-                if let Some(c) = base_for_seed[ayu][axu] { 
+            let mut group: HashSet<(usize, usize)> = get_connected_cells(base_for_seed, nx, ny)
+                .into_iter()
+                .collect();
+            for (dx, dy) in dirs {
+                let ax = col as isize + dx;
+                let ay = empty_y as isize + dy;
+                if !in_range(ax, ay) {
+                    continue;
+                }
+                let axu = ax as usize;
+                let ayu = ay as usize;
+                if let Some(c) = base_for_seed[ayu][axu] {
                     if c.color == candidate_color {
-                        for p in get_connected_cells(base_for_seed, axu, ayu) { group.insert(p); }
+                        for p in get_connected_cells(base_for_seed, axu, ayu) {
+                            group.insert(p);
+                        }
                     }
                 }
             }
             let mut candidate_field = base_for_seed.clone();
-            candidate_field[empty_y][col] = Some(CellData{ color: candidate_color, iter: IterId(iteration), original_pos: None });
+            candidate_field[empty_y][col] = Some(CellData {
+                color: candidate_color,
+                iter: IterId(iteration),
+                original_pos: None,
+            });
             apply_gravity(&mut candidate_field);
             let mut det = Detector::new(candidate_field.clone());
             let chain_count = det.simulate_chain();
@@ -160,18 +185,21 @@ fn try_extended_cleanup_arrangement(
     // vlog!("  [拡張] A候補数={}", candidate_groups.len());
     // A候補を連鎖スコア降順で試す
     let mut groups_sorted = candidate_groups;
-    groups_sorted.sort_by(|a,b| b.0.cmp(&a.0));
+    groups_sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut successful_candidates: Vec<(i32, Board, u8, Option<usize>)> = Vec::new();
-    
+
     // iteration=2で前回追加した列から最も遠い列を計算（一度だけ）
     let mut newly_blocked_col: Option<usize> = None;
 
-    for (seed_chain, puyo_a_group, _seed_col, target_color, _seed_pos) in groups_sorted.into_iter() {
+    for (seed_chain, puyo_a_group, _seed_col, target_color, _seed_pos) in groups_sorted.into_iter()
+    {
         vlog!("    [拡張] A対象色={} を試行", color_name(target_color));
 
         // iteration=2以降で、前回追加した列がある場合、Aグループから最も遠い列を1つブロック
-        let mut dynamic_blocked = blocked_columns.map(|b| b.clone()).unwrap_or_else(|| HashSet::new());
+        let mut dynamic_blocked = blocked_columns
+            .map(|b| b.clone())
+            .unwrap_or_else(|| HashSet::new());
         if iteration == 2 && !last_iteration_added_cols.is_empty() && newly_blocked_col.is_none() {
             // Aグループの各セルから各列までの最小距離を計算
             let mut col_distances: Vec<(usize, i32)> = Vec::new();
@@ -187,7 +215,11 @@ fn try_extended_cleanup_arrangement(
             if let Some(&(farthest_col, dist)) = col_distances.iter().max_by_key(|(_, d)| d) {
                 dynamic_blocked.insert(farthest_col);
                 newly_blocked_col = Some(farthest_col);
-                vlog!("    [拡張] Aグループから最も遠い列{}をブロック（距離={}）", farthest_col, dist);
+                vlog!(
+                    "    [拡張] Aグループから最も遠い列{}をブロック（距離={}）",
+                    farthest_col,
+                    dist
+                );
             }
         } else if iteration == 2 && newly_blocked_col.is_some() {
             // 既にブロック列が決定済みの場合は、それを使用
@@ -214,46 +246,86 @@ fn try_extended_cleanup_arrangement(
         // 1連鎖目の禁止ルールを Leftover/PreChain で内訳
         let mut cnt_first_multi_L: usize = 0; // leftover+追加 側で検出
         let mut cnt_first_multi_P: usize = 0; // pre_chain+追加 側で検出
-        let mut cnt_no_latest_L: usize = 0;   // leftover+追加 側で検出
-        let mut cnt_no_latest_P: usize = 0;   // pre_chain+追加 側で検出
+        let mut cnt_no_latest_L: usize = 0; // leftover+追加 側で検出
+        let mut cnt_no_latest_P: usize = 0; // pre_chain+追加 側で検出
 
         let total_candidates = candidates.len();
         let mut color_accepted = false;
-        'candidate_loop: for (cand_idx, (_candidate_chain, candidate_field, coords)) in candidates.into_iter().enumerate() {
-            if LOG_CANDIDATE_DETAIL { 
-                vlog!("\n========== 候補 {}/{} の評価開始 ==========", cand_idx + 1, total_candidates); 
-                vlog!("[候補{}/{}] 対象色={} / 基点座標:({}, {})", cand_idx + 1, total_candidates, color_name(target_color), coords.0, coords.1);
+        'candidate_loop: for (cand_idx, (_candidate_chain, candidate_field, coords)) in
+            candidates.into_iter().enumerate()
+        {
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "\n========== 候補 {}/{} の評価開始 ==========",
+                    cand_idx + 1,
+                    total_candidates
+                );
+                vlog!(
+                    "[候補{}/{}] 対象色={} / 基点座標:({}, {})",
+                    cand_idx + 1,
+                    total_candidates,
+                    color_name(target_color),
+                    coords.0,
+                    coords.1
+                );
             }
             // (1) leftover+追加 で連鎖を評価し、1連鎖目の禁止ルールをここで適用
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ1: leftover+追加 で評価", cand_idx + 1, total_candidates); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ1: leftover+追加 で評価",
+                    cand_idx + 1,
+                    total_candidates
+                );
+            }
             let mut det2 = Detector::new(candidate_field.clone());
             let new_chain_candidate = det2.simulate_chain();
             if new_chain_candidate == -1 {
                 if let Some(r) = det2.take_last_reject() {
                     match r {
-                        RejectKind::FirstChainMultipleGroups => { 
-                            cnt_first_multi += 1; cnt_first_multi_L += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で複数グループ同時消し（leftover側で検出）", cand_idx + 1, total_candidates); }
+                        RejectKind::FirstChainMultipleGroups => {
+                            cnt_first_multi += 1;
+                            cnt_first_multi_L += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で複数グループ同時消し（leftover側で検出）", cand_idx + 1, total_candidates);
+                            }
                             continue 'candidate_loop;
                         }
-                        RejectKind::FirstChainNoLatestAdd => { 
-                            cnt_no_latest += 1; cnt_no_latest_L += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で最新追加が関与せず（leftover側で検出）", cand_idx + 1, total_candidates); }
+                        RejectKind::FirstChainNoLatestAdd => {
+                            cnt_no_latest += 1;
+                            cnt_no_latest_L += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で最新追加が関与せず（leftover側で検出）", cand_idx + 1, total_candidates);
+                            }
                             continue 'candidate_loop;
                         }
-                        RejectKind::MixedIterationInGroup => { 
-                            cnt_mixed_iter += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: グループ内で異なるiteration混在（leftover側で検出）", cand_idx + 1, total_candidates); }
+                        RejectKind::MixedIterationInGroup => {
+                            cnt_mixed_iter += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: グループ内で異なるiteration混在（leftover側で検出）", cand_idx + 1, total_candidates);
+                            }
                             continue 'candidate_loop;
                         }
                     }
                 } else {
                     cnt_other_reject += 1;
-                    if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: その他（leftover側で不明な理由）", cand_idx + 1, total_candidates); }
+                    if LOG_CANDIDATE_SUMMARY {
+                        vlog!(
+                            "[候補{}/{}] ❌棄却理由: その他（leftover側で不明な理由）",
+                            cand_idx + 1,
+                            total_candidates
+                        );
+                    }
                     continue 'candidate_loop;
                 }
             }
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ1: 通過 (chain={})", cand_idx + 1, total_candidates, new_chain_candidate); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ1: 通過 (chain={})",
+                    cand_idx + 1,
+                    total_candidates,
+                    new_chain_candidate
+                );
+            }
 
             // 追加数カウント
             let mut additional_counts = vec![0usize; W];
@@ -263,48 +335,82 @@ fn try_extended_cleanup_arrangement(
                 additional_counts[x] = cnt_cand.saturating_sub(cnt_left);
             }
             let add_sum: usize = additional_counts.iter().sum();
-            
+
             // 配置パターンを詳細に出力（検索用）
             if LOG_CANDIDATE_DETAIL || LOG_CANDIDATE_SUMMARY {
                 let mut pattern_parts: Vec<String> = Vec::new();
                 for x in 0..W {
                     if additional_counts[x] > 0 {
-                        pattern_parts.push(format!("{}列目に{}を{}個", x, color_name(target_color), additional_counts[x]));
+                        pattern_parts.push(format!(
+                            "{}列目に{}を{}個",
+                            x,
+                            color_name(target_color),
+                            additional_counts[x]
+                        ));
                     }
                 }
                 if !pattern_parts.is_empty() {
-                    vlog!("[候補{}/{}] 配置パターン: {}", cand_idx + 1, total_candidates, pattern_parts.join("、"));
+                    vlog!(
+                        "[候補{}/{}] 配置パターン: {}",
+                        cand_idx + 1,
+                        total_candidates,
+                        pattern_parts.join("、")
+                    );
                 }
             }
-            
+
             if add_sum == 0 {
                 cnt_zero_add += 1;
-                if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 追加数が0", cand_idx + 1, total_candidates); }
+                if LOG_CANDIDATE_SUMMARY {
+                    vlog!(
+                        "[候補{}/{}] ❌棄却理由: 追加数が0",
+                        cand_idx + 1,
+                        total_candidates
+                    );
+                }
                 continue 'candidate_loop;
             }
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ2: 追加数チェック通過 (追加={}個)", cand_idx + 1, total_candidates, add_sum); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ2: 追加数チェック通過 (追加={}個)",
+                    cand_idx + 1,
+                    total_candidates,
+                    add_sum
+                );
+            }
 
             // pre_chain_field に candidate の追加分だけを合成
             let mut merged_field_candidate = pre_chain_field.clone();
             for x in 0..W {
-                let mut base_col: Vec<CellData> = (0..H).filter_map(|y| merged_field_candidate[y][x]).collect(); // bottom->top
-                let cand_col: Vec<CellData> = (0..H).filter_map(|y| candidate_field[y][x]).collect(); // bottom->top
+                let mut base_col: Vec<CellData> = (0..H)
+                    .filter_map(|y| merged_field_candidate[y][x])
+                    .collect(); // bottom->top
+                let cand_col: Vec<CellData> =
+                    (0..H).filter_map(|y| candidate_field[y][x]).collect(); // bottom->top
                 let take_n = additional_counts[x].min(cand_col.len());
                 if take_n > 0 {
                     let start = cand_col.len() - take_n;
                     base_col.extend_from_slice(&cand_col[start..]); // append top-most additions
                 }
                 for y in 0..H {
-                    merged_field_candidate[y][x] = if y < base_col.len() { Some(base_col[y]) } else { None };
+                    merged_field_candidate[y][x] = if y < base_col.len() {
+                        Some(base_col[y])
+                    } else {
+                        None
+                    };
                 }
             }
             apply_gravity(&mut merged_field_candidate);
 
             // (2) pre_chain+追加 でも 1連鎖目の禁止ルール（複数同時消し/最新追加不関与）と
             //     iteration 整合（同一グループ内 異iteration混在）を確認する。
-            
-            if LOG_CANDIDATE_DETAIL { 
-                vlog!("[候補{}/{}] ステップ3: pre_chain+追加 で評価", cand_idx + 1, total_candidates);
+
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ3: pre_chain+追加 で評価",
+                    cand_idx + 1,
+                    total_candidates
+                );
                 // デバッグ: マージ後の盤面を出力
                 vlog!("    [候補/DEBUG] マージ後の盤面 (pre_chain+追加):");
                 for y in (0..H).rev() {
@@ -320,99 +426,191 @@ fn try_extended_cleanup_arrangement(
                     vlog!("{}", line);
                 }
             }
-            
+
             let mut md = Detector::new(merged_field_candidate.clone());
             let merged_chain = md.simulate_chain();
             if merged_chain == -1 {
                 if let Some(r) = md.take_last_reject() {
                     match r {
-                        RejectKind::MixedIterationInGroup => { 
-                            cnt_mixed_iter += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: グループ内で異なるiteration混在（pre_chain側で検出）", cand_idx + 1, total_candidates); }
-                            continue 'candidate_loop; 
+                        RejectKind::MixedIterationInGroup => {
+                            cnt_mixed_iter += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: グループ内で異なるiteration混在（pre_chain側で検出）", cand_idx + 1, total_candidates);
+                            }
+                            continue 'candidate_loop;
                         }
-                        RejectKind::FirstChainMultipleGroups => { 
-                            cnt_first_multi += 1; cnt_first_multi_P += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で複数グループ同時消し（pre_chain側で検出）", cand_idx + 1, total_candidates); }
-                            continue 'candidate_loop; 
+                        RejectKind::FirstChainMultipleGroups => {
+                            cnt_first_multi += 1;
+                            cnt_first_multi_P += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で複数グループ同時消し（pre_chain側で検出）", cand_idx + 1, total_candidates);
+                            }
+                            continue 'candidate_loop;
                         }
-                        RejectKind::FirstChainNoLatestAdd => { 
-                            cnt_no_latest += 1; cnt_no_latest_P += 1; 
-                            if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で最新追加が関与せず（pre_chain側で検出）", cand_idx + 1, total_candidates); }
-                            continue 'candidate_loop; 
+                        RejectKind::FirstChainNoLatestAdd => {
+                            cnt_no_latest += 1;
+                            cnt_no_latest_P += 1;
+                            if LOG_CANDIDATE_SUMMARY {
+                                vlog!("[候補{}/{}] ❌棄却理由: 1連鎖目で最新追加が関与せず（pre_chain側で検出）", cand_idx + 1, total_candidates);
+                            }
+                            continue 'candidate_loop;
                         }
                     }
                 } else {
                     // 未特定は安全側でスキップ
                     cnt_other_reject += 1;
-                    if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: その他（pre_chain側で不明な理由）", cand_idx + 1, total_candidates); }
+                    if LOG_CANDIDATE_SUMMARY {
+                        vlog!(
+                            "[候補{}/{}] ❌棄却理由: その他（pre_chain側で不明な理由）",
+                            cand_idx + 1,
+                            total_candidates
+                        );
+                    }
                     continue 'candidate_loop;
                 }
             }
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ3: 通過 (merged_chain={})", cand_idx + 1, total_candidates, merged_chain); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ3: 通過 (merged_chain={})",
+                    cand_idx + 1,
+                    total_candidates,
+                    merged_chain
+                );
+            }
 
             // current_new_additions_candidate の抽出と色統一
-            let mut current_new: HashSet<(usize,usize)> = HashSet::new();
-            for y in 0..H { for x in 0..W {
-                if merged_field_candidate[y][x].is_some() && pre_chain_field[y][x].is_none() {
-                    merged_field_candidate[y][x] = Some(CellData{ color: target_color, iter: IterId(iteration), original_pos: None });
-                    current_new.insert((x,y));
+            let mut current_new: HashSet<(usize, usize)> = HashSet::new();
+            for y in 0..H {
+                for x in 0..W {
+                    if merged_field_candidate[y][x].is_some() && pre_chain_field[y][x].is_none() {
+                        merged_field_candidate[y][x] = Some(CellData {
+                            color: target_color,
+                            iter: IterId(iteration),
+                            original_pos: None,
+                        });
+                        current_new.insert((x, y));
+                    }
                 }
-            }}
+            }
 
             // puyo_c: 今回追加するぷよ（current_new）でも、Aグループでもない、既存の同色ぷよ
             // ただし、現在のiterationより古いぷよ（既に盤面にあった元々のぷよ）は除外する
-            let mut puyo_c: HashSet<(usize,usize)> = HashSet::new();
-            for y in 0..H { for x in 0..W {
-                if let Some(c) = merged_field_candidate[y][x] {
-                    // 現在のiterationのぷよのみをCの対象とする（元々あったぷよはAの一部として扱う）
-                    if c.color == target_color && c.iter.0 == iteration && !puyo_a_group.contains(&(x,y)) {
-                        puyo_c.insert((x,y));
+            let mut puyo_c: HashSet<(usize, usize)> = HashSet::new();
+            for y in 0..H {
+                for x in 0..W {
+                    if let Some(c) = merged_field_candidate[y][x] {
+                        // 現在のiterationのぷよのみをCの対象とする（元々あったぷよはAの一部として扱う）
+                        if c.color == target_color
+                            && c.iter.0 == iteration
+                            && !puyo_a_group.contains(&(x, y))
+                        {
+                            puyo_c.insert((x, y));
+                        }
                     }
                 }
-            }}
-            for p in &current_new { puyo_c.remove(p); }
-            
+            }
+            for p in &current_new {
+                puyo_c.remove(p);
+            }
+
             if LOG_CANDIDATE_DETAIL {
-                vlog!("[候補{}/{}] デバッグ: puyo_a_group={:?}", cand_idx + 1, total_candidates, puyo_a_group);
-                vlog!("[候補{}/{}] デバッグ: current_new={:?}", cand_idx + 1, total_candidates, current_new);
-                vlog!("[候補{}/{}] デバッグ: puyo_c={:?}", cand_idx + 1, total_candidates, puyo_c);
+                vlog!(
+                    "[候補{}/{}] デバッグ: puyo_a_group={:?}",
+                    cand_idx + 1,
+                    total_candidates,
+                    puyo_a_group
+                );
+                vlog!(
+                    "[候補{}/{}] デバッグ: current_new={:?}",
+                    cand_idx + 1,
+                    total_candidates,
+                    current_new
+                );
+                vlog!(
+                    "[候補{}/{}] デバッグ: puyo_c={:?}",
+                    cand_idx + 1,
+                    total_candidates,
+                    puyo_c
+                );
             }
 
             // 衝突判定（新規追加がCと隣接するか）
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ4: C隣接衝突チェック", cand_idx + 1, total_candidates); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ4: C隣接衝突チェック",
+                    cand_idx + 1,
+                    total_candidates
+                );
+            }
             for &(bx, by) in &current_new {
-                const DIRS: [(isize,isize);4] = [(1,0),(-1,0),(0,1),(0,-1)];
-                for (dx,dy) in DIRS {
-                    let nx = bx as isize + dx; let ny = by as isize + dy;
-                    if nx < 0 || ny < 0 { continue; }
-                    let nxu = nx as usize; let nyu = ny as usize;
-                    if nxu < W && nyu < H && puyo_c.contains(&(nxu,nyu)) {
+                const DIRS: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+                for (dx, dy) in DIRS {
+                    let nx = bx as isize + dx;
+                    let ny = by as isize + dy;
+                    if nx < 0 || ny < 0 {
+                        continue;
+                    }
+                    let nxu = nx as usize;
+                    let nyu = ny as usize;
+                    if nxu < W && nyu < H && puyo_c.contains(&(nxu, nyu)) {
                         cnt_c_collision += 1;
-                        if LOG_CANDIDATE_SUMMARY { vlog!("[候補{}/{}] ❌棄却理由: 新規追加がC（既存の同色ぷよ）と隣接", cand_idx + 1, total_candidates); }
+                        if LOG_CANDIDATE_SUMMARY {
+                            vlog!(
+                                "[候補{}/{}] ❌棄却理由: 新規追加がC（既存の同色ぷよ）と隣接",
+                                cand_idx + 1,
+                                total_candidates
+                            );
+                        }
                         continue 'candidate_loop; // 次の候補へ
                     }
                 }
             }
-            if LOG_CANDIDATE_DETAIL { vlog!("[候補{}/{}] ステップ4: 通過", cand_idx + 1, total_candidates); }
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "[候補{}/{}] ステップ4: 通過",
+                    cand_idx + 1,
+                    total_candidates
+                );
+            }
 
             // 採用時の詳細な理由を出力
             if LOG_ONLY_ACCEPTED || LOG_CANDIDATE_SUMMARY {
                 let mut pattern_parts: Vec<String> = Vec::new();
                 for x in 0..W {
                     if additional_counts[x] > 0 {
-                        pattern_parts.push(format!("{}列目に{}を{}個", x, color_name(target_color), additional_counts[x]));
+                        pattern_parts.push(format!(
+                            "{}列目に{}を{}個",
+                            x,
+                            color_name(target_color),
+                            additional_counts[x]
+                        ));
                     }
                 }
-                vlog!("      ✅ 採用: 色={} 基点:({},{}) new_chain={}", 
-                         color_name(target_color), coords.0, coords.1, new_chain_candidate);
+                vlog!(
+                    "      ✅ 採用: 色={} 基点:({},{}) new_chain={}",
+                    color_name(target_color),
+                    coords.0,
+                    coords.1,
+                    new_chain_candidate
+                );
                 if !pattern_parts.is_empty() {
                     vlog!("         配置: {}", pattern_parts.join("、"));
                 }
                 vlog!("         採用理由: 全チェックを通過（leftover+追加で連鎖成立 / pre_chain+追加で連鎖成立 / C隣接なし）");
             }
-            if LOG_CANDIDATE_DETAIL { vlog!("========== 候補 {}/{} の評価終了（✅採用） ==========\n", cand_idx + 1, total_candidates); }
-            successful_candidates.push((new_chain_candidate, merged_field_candidate, target_color, newly_blocked_col));
+            if LOG_CANDIDATE_DETAIL {
+                vlog!(
+                    "========== 候補 {}/{} の評価終了（✅採用） ==========\n",
+                    cand_idx + 1,
+                    total_candidates
+                );
+            }
+            successful_candidates.push((
+                new_chain_candidate,
+                merged_field_candidate,
+                target_color,
+                newly_blocked_col,
+            ));
             color_accepted = true;
             break 'candidate_loop; // この色では最初の成功候補のみ採用
         }
@@ -421,7 +619,8 @@ fn try_extended_cleanup_arrangement(
         if total_candidates > 0 && !color_accepted {
             vlog!(
                 "      ❌ 色={}: 全{}件棄却",
-                color_name(target_color), total_candidates
+                color_name(target_color),
+                total_candidates
             );
             vlog!(
                 "         棄却理由内訳: 複数同時消し={}(L:{}/P:{}) / 最新不関与={}(L:{}/P:{}) / C隣接={} / 追加0={} / iteration混在={} / その他={}",
@@ -450,7 +649,9 @@ pub fn iterative_chain_clearing(
     let baseline_chain = base_chain.unwrap_or_else(|| det0.simulate_chain());
     vlog!(
         "[ビーム] 開始: baseline_chain={} / beam_width={} / max_depth={}",
-        baseline_chain, beam_width, max_depth
+        baseline_chain,
+        beam_width,
+        max_depth
     );
 
     let initial = BeamState {
@@ -466,9 +667,15 @@ pub fn iterative_chain_clearing(
     let mut best_state = initial;
 
     while !beam.is_empty() {
-        let cur_depth = if beam.is_empty() { 0 } else { beam[0].iteration };
+        let cur_depth = if beam.is_empty() {
+            0
+        } else {
+            beam[0].iteration
+        };
         vlog!("[ビーム] 深さ={} / ビーム幅={}", cur_depth, beam.len());
-        if beam.iter().all(|s| s.iteration >= max_depth) { break; }
+        if beam.iter().all(|s| s.iteration >= max_depth) {
+            break;
+        }
         let mut next_beam: Vec<BeamState> = Vec::new();
         let mut any_extended = false;
         for state in beam.into_iter() {
@@ -479,14 +686,21 @@ pub fn iterative_chain_clearing(
                 state.acc_chain,
                 state.blocked_cols.len()
             );
-            if state.iteration >= max_depth { next_beam.push(state); continue; }
+            if state.iteration >= max_depth {
+                next_beam.push(state);
+                continue;
+            }
             let it = state.iteration + 1;
             let candidates = try_extended_cleanup_arrangement(
                 &state.field,
                 original_field,
                 baseline_chain,
                 it,
-                if it > 2 { Some(&state.blocked_cols) } else { None },
+                if it > 2 {
+                    Some(&state.blocked_cols)
+                } else {
+                    None
+                },
                 Some(&state.prev_adds),
                 &state.last_added_cols,
             );
@@ -499,27 +713,49 @@ pub fn iterative_chain_clearing(
                     let new_add = extract_additions(&candidate, &state.field);
                     let accum = add_accumulated(&state.acc_adds, &new_add);
                     let add_sum: usize = new_add.iter().map(|v| v.len()).sum();
-                    let add_cols: Vec<_> = new_add.iter().enumerate().filter(|(_, v)| !v.is_empty()).map(|(i, _)| i).collect();
-                    vlog!("    [展開結果] it={} 追加={}個 / 列={:?} / 色={} / new_chain={}", 
-                             it, add_sum, add_cols, color_name(used_color), new_chain);
+                    let add_cols: Vec<_> = new_add
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| !v.is_empty())
+                        .map(|(i, _)| i)
+                        .collect();
+                    vlog!(
+                        "    [展開結果] it={} 追加={}個 / 列={:?} / 色={} / new_chain={}",
+                        it,
+                        add_sum,
+                        add_cols,
+                        color_name(used_color),
+                        new_chain
+                    );
                     let mut blk = state.blocked_cols.clone();
                     // iteration 2で新たにブロックした列を追加
                     if let Some(col) = newly_blocked {
                         blk.insert(col);
-                        vlog!("    [ブロック] iteration {} で列 {} を追加ブロック（合計 {} 列）", it, col, blk.len());
+                        vlog!(
+                            "    [ブロック] iteration {} で列 {} を追加ブロック（合計 {} 列）",
+                            it,
+                            col,
+                            blk.len()
+                        );
                     }
                     // iteration 1で追加した列を記録（iteration 2でAグループに基づいてブロック判定）
-                    let next_last_added_cols = if it == 1 { add_cols.clone() } else { state.last_added_cols.clone() };
+                    let next_last_added_cols = if it == 1 {
+                        add_cols.clone()
+                    } else {
+                        state.last_added_cols.clone()
+                    };
                     let mut new_prev = HashMap::new();
-                    for y in 0..H { for x in 0..W {
-                        if candidate[y][x].is_some() && state.field[y][x].is_none() {
-                            new_prev.insert((x,y), candidate[y][x].unwrap());
+                    for y in 0..H {
+                        for x in 0..W {
+                            if candidate[y][x].is_some() && state.field[y][x].is_none() {
+                                new_prev.insert((x, y), candidate[y][x].unwrap());
+                            }
                         }
-                    }}
+                    }
                     let mut merged_prev = state.prev_adds.clone();
                     merged_prev.extend(new_prev.into_iter());
                     let next_field = build_field_from_accum(original_field, &accum);
-                    next_beam.push(BeamState{
+                    next_beam.push(BeamState {
                         field: next_field,
                         acc_chain: state.acc_chain + new_chain,
                         acc_adds: accum,
@@ -535,13 +771,18 @@ pub fn iterative_chain_clearing(
             vlog!("[ビーム] 追加配置が一度も発生せず、探索終了");
             break;
         }
-        next_beam.sort_by(|a,b| b.acc_chain.cmp(&a.acc_chain));
+        next_beam.sort_by(|a, b| b.acc_chain.cmp(&a.acc_chain));
         let mut chains: Vec<i32> = next_beam.iter().map(|s| s.acc_chain).collect();
-        chains.sort_unstable_by(|a,b| b.cmp(a));
-        vlog!("[ビーム] 次ビーム候補（上位）: {:?}", &chains[..chains.len().min(5)]);
+        chains.sort_unstable_by(|a, b| b.cmp(a));
+        vlog!(
+            "[ビーム] 次ビーム候補（上位）: {:?}",
+            &chains[..chains.len().min(5)]
+        );
         beam = next_beam.into_iter().take(beam_width.max(1)).collect();
         for s in &beam {
-            if s.acc_chain > best_state.acc_chain { best_state = s.clone(); }
+            if s.acc_chain > best_state.acc_chain {
+                best_state = s.clone();
+            }
         }
     }
 
