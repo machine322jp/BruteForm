@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 // ライブラリから必要な型をインポート
-use rust_bruteforce::app::App;
+use bruteform::app::App;
 
 fn main() -> Result<()> {
     // eframe の起動オプション

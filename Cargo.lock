@@ -608,6 +608,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bruteform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "dashmap",
+ "eframe",
+ "egui",
+ "nohash-hasher",
+ "num-bigint",
+ "num-traits",
+ "rand",
+ "rayon",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2711,25 +2730,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "rust_bruteforce"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "dashmap",
- "eframe",
- "egui",
- "nohash-hasher",
- "num-bigint",
- "num-traits",
- "rand",
- "rayon",
- "rfd",
- "serde",
- "serde_json",
 ]
 
 [[package]]
