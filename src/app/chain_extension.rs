@@ -2,7 +2,7 @@
 
 use crate::app::board_evaluation::BoardEvaluator;
 use crate::app::bruteforce_search::BruteforceSearch;
-use crate::chain::{board_to_cols, cols_to_board, Board, ChainStep, Detector};
+use crate::domain::chain_legacy::{board_to_cols, cols_to_board, Board, ChainStep, Detector};
 use crate::constants::{H, W};
 use crate::vlog;
 use std::collections::{HashMap, HashSet};

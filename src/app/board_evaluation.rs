@@ -2,7 +2,7 @@
 
 use crate::app::chain_play::Orient;
 use crate::constants::{H, W};
-use crate::search::hash::canonical_hash64_fast;
+use crate::domain::board::hash::canonical_hash64_fast;
 use crate::vlog;
 use std::collections::{HashSet, VecDeque};
 

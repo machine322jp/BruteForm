@@ -5,7 +5,7 @@ use super::piece_placer::PiecePlacer;
 use super::state_manager::StateManager;
 use crate::app::board_evaluation::BoardEvaluator;
 use crate::app::chain_play::{ChainPlay, Orient};
-use crate::chain::{cols_to_board, Detector};
+use crate::domain::chain_legacy::{cols_to_board, Detector};
 use crate::constants::{H, W};
 use crate::vlog;
 use std::collections::HashSet;
@@ -23,7 +23,7 @@ impl TargetOperations {
         let bw = beam_width.max(1);
         let md_u8 = max_depth.max(1).min(255);
         let (target, chain) =
-            crate::chain::compute_target_from_actual_with_params(&cp.cols, bw, md_u8);
+            crate::domain::chain_legacy::beam::compute_target_from_actual_with_params(&cp.cols, bw, md_u8);
         cp.target_board = target;
         format!(
             "目標盤面を更新しました（推定最大連鎖: {} / ビーム幅: {} / 最大深さ: {}）",

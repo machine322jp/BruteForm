@@ -23,18 +23,6 @@ pub struct Stats {
     pub profile: ProfileTotals,
 }
 
-/// 統計の増分
-#[derive(Clone, Copy, Default)]
-pub struct StatDelta {
-    pub nodes: u64,
-    pub leaves: u64,
-    pub outputs: u64,
-    pub pruned: u64,
-    pub lhit: u64,
-    pub ghit: u64,
-    pub mmiss: u64,
-}
-
 /// 探索スレッドからのメッセージ
 pub enum Message {
     Log(String),

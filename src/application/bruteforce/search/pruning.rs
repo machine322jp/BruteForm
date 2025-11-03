@@ -1,7 +1,7 @@
 // 枝刈りと到達判定
 
 use crate::constants::{BOARD_MASK, H, MASK14, W};
-use crate::search::board::{
+use crate::domain::board::bitboard::{
     any_color_has_four, apply_erase_and_fall_cols, apply_erase_and_fall_exact4, fall_cols_fast,
     pack_cols, unpack_mask_to_cols, StepExact, BB,
 };

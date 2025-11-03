@@ -4,15 +4,17 @@ pub mod bruteforce;
 pub mod chainplay;
 pub mod helpers;
 
+// cell_styleを公開（UI用ヘルパー）
+pub use helpers::cell_style;
+
 use crossbeam_channel::unbounded;
-use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
 use crate::app::chain_operations::ChainOperations;
 use crate::app::{App, Message, Mode};
+use crate::application::bruteforce::BruteforceService;
 use crate::profiling::{has_profile_any, ProfileTotals};
-use crate::search::run_search;
 
 use bruteforce::BruteforceUI;
 use chainplay::ChainplayUI;
@@ -66,13 +68,11 @@ impl eframe::App for App {
                         st.profile = prof;
                         self.stats = st;
                         self.running = false;
-                        self.abort_flag.store(false, Ordering::Relaxed);
                         self.push_log("完了".into());
                         keep_rx = false;
                     }
                     Message::Error(e) => {
                         self.running = false;
-                        self.abort_flag.store(false, Ordering::Relaxed);
                         self.push_log(format!("エラー: {e}"));
                         keep_rx = false;
                     }
@@ -169,52 +169,74 @@ impl eframe::App for App {
 
 impl App {
     pub fn start_run(&mut self) {
-        let threshold = self.threshold.clamp(1, 19);
-        let lru_limit = (self.lru_k.clamp(10, 1000) as usize) * 1000;
+        use crate::domain::search::{SearchConfig, ChainCount, CacheSize, Ratio};
+        
+        // SearchConfigを構築（Value Objectsを使用）
+        let threshold = ChainCount::new(self.threshold.clamp(1, 19))
+            .unwrap_or_else(|_| ChainCount::new(7).unwrap());
+        let lru_limit = CacheSize::new_in_thousands(self.lru_k.clamp(10, 1000))
+            .unwrap_or_else(|_| CacheSize::new_in_thousands(300).unwrap());
+        let stop_progress_plateau = Ratio::new(self.stop_progress_plateau.clamp(0.0, 1.0))
+            .unwrap_or_else(|_| Ratio::zero());
+        
+        let config = SearchConfig {
+            threshold,
+            lru_limit,
+            exact_four_only: self.exact_four_only,
+            stop_progress_plateau,
+            profile_enabled: self.profile_enabled,
+        };
+        
         let outfile = if let Some(p) = &self.out_path {
             p.clone()
         } else {
             std::path::PathBuf::from(&self.out_name)
         };
-        let board_chars: Vec<char> = self.board.iter().map(|c| c.label_char()).collect();
 
-        let (tx, rx) = unbounded::<Message>();
-        self.rx = Some(rx);
-        self.running = true;
-        self.preview = None;
-        self.log_lines.clear();
-        self.stats.profile = ProfileTotals::default();
-
-        let abort = self.abort_flag.clone();
-        abort.store(false, Ordering::Relaxed);
-
-        let stop_progress_plateau = self.stop_progress_plateau.clamp(0.0, 1.0);
-        let exact_four_only = self.exact_four_only;
-        let profile_enabled = self.profile_enabled;
+        // Board を構築
+        let board = match crate::domain::board::Board::try_from_slice(&self.board) {
+            Ok(b) => b,
+            Err(e) => {
+                self.push_log(format!("盤面構築エラー: {e:?}"));
+                return;
+            }
+        };
 
         self.push_log(format!(
             "出力: JSONL / 形キャッシュ上限 ≈ {} 形 / 保存先: {} / 進捗停滞比={:.2} / 4個消しモード={} / 計測={}",
-            lru_limit,
+            config.lru_limit.get(),
             outfile.display(),
-            stop_progress_plateau,
-            if exact_four_only { "ON" } else { "OFF" },
-            if profile_enabled { "ON" } else { "OFF" },
+            config.stop_progress_plateau.get(),
+            if config.exact_four_only { "ON" } else { "OFF" },
+            if config.profile_enabled { "ON" } else { "OFF" },
         ));
 
-        thread::spawn(move || {
-            if let Err(e) = run_search(
-                board_chars,
-                threshold,
-                lru_limit,
-                outfile,
-                tx.clone(),
-                abort,
-                stop_progress_plateau,
-                exact_four_only,
-                profile_enabled,
-            ) {
-                let _ = tx.send(Message::Error(format!("{e:?}")));
+        // BruteforceServiceを使って検索を開始
+        match BruteforceService::start_search_async(&board, config, outfile) {
+            Ok((handle, event_rx)) => {
+                // SearchEvent → Message 変換用のチャンネル
+                let (msg_tx, msg_rx) = unbounded::<Message>();
+                
+                self.rx = Some(msg_rx);
+                self.running = true;
+                self.preview = None;
+                self.log_lines.clear();
+                self.stats.profile = ProfileTotals::default();
+                self.search_handle = Some(handle);
+
+                // イベント変換スレッド
+                thread::spawn(move || {
+                    while let Ok(event) = event_rx.recv() {
+                        let msg = crate::app::event_adapter::search_event_to_message(event);
+                        if msg_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-        });
+            Err(e) => {
+                self.push_log(format!("検索開始エラー: {e:?}"));
+            }
+        }
     }
 }

@@ -4,8 +4,10 @@ use egui::{Color32, RichText, Vec2};
 use num_traits::ToPrimitive;
 
 use crate::app::App;
+use crate::app::ui::cell_style;
 use crate::constants::{H, W};
-use crate::model::{cell_style, cycle_abs, cycle_any, cycle_fixed, Cell};
+use crate::domain::board::cell::{cycle_abs, cycle_any, cycle_fixed};
+use crate::domain::board::Cell;
 
 pub struct BruteforceUI;
 
@@ -64,8 +66,9 @@ impl BruteforceUI {
                     .add_enabled(app.running, egui::Button::new("Stop"))
                     .clicked()
                 {
-                    app.abort_flag
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(handle) = &app.search_handle {
+                        handle.abort();
+                    }
                 }
             });
 

@@ -1,51 +1,59 @@
 // 探索エンジン
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Sender};
+use anyhow::{anyhow, Result};
+use crossbeam_channel::Sender;
 use nohash_hasher::BuildNoHashHasher;
 use num_bigint::BigUint;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{One, Zero};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::app::{Message, StatDelta, Stats};
+use crate::application::bruteforce::event::{SearchEvent, SearchProgress, StatDelta};
 use crate::constants::{DU64Map, DU64Set, U64Set, H, W};
-use crate::profiling::{time_delta_has_any, ProfileTotals, TimeDelta};
-use crate::search::coloring::*;
-use crate::search::dfs::dfs_combine_parallel;
-use crate::search::lru::{array_init, ApproxLru};
+use crate::profiling::{time_delta_has_any, TimeDelta};
+use crate::domain::constraints::coloring::*;
+use crate::domain::search::SearchConfig;
+use crate::application::bruteforce::search::dfs::dfs_combine_parallel;
+use crate::application::bruteforce::search::writer::spawn_writer_thread;
+use crate::application::bruteforce::search::aggregator::spawn_aggregator_thread;
+use crate::infrastructure::cache::lru::{array_init, ApproxLru};
 
-#[allow(clippy::too_many_arguments)]
+/// 彩色メタデータ
+struct ColoringMeta {
+    label_to_color: HashMap<char, u8>,
+    generators: [ColGen; W],
+    max_fill: [u8; W],
+    column_order: Vec<usize>,
+}
+
 pub fn run_search(
     base_board: Vec<char>,
-    threshold: u32,
-    lru_limit: usize,
+    config: &SearchConfig,
     outfile: PathBuf,
-    tx: Sender<Message>,
+    tx: Sender<SearchEvent>,
     abort: Arc<AtomicBool>,
-    stop_progress_plateau: f32,
-    exact_four_only: bool,
-    profile_enabled: bool,
 ) -> Result<()> {
+    let threshold = config.threshold.get();
+    let lru_limit = config.lru_limit.get();
+    let stop_progress_plateau = config.stop_progress_plateau.get();
+    let exact_four_only = config.exact_four_only;
+    let profile_enabled = config.profile_enabled;
     let info = build_abstract_info(&base_board);
     let colorings = enumerate_colorings_fast(&info);
     if colorings.is_empty() {
-        let _ = tx.send(Message::Log(
+        let _ = tx.send(SearchEvent::Log(
             "抽象ラベルの4色彩色が存在しないため、探索を終了します。".into(),
         ));
-        let _ = tx.send(Message::Finished(Stats::default()));
+        let _ = tx.send(SearchEvent::Finished(SearchProgress::default()));
         return Ok(());
     }
-    let _ = tx.send(Message::Log(format!(
+    let _ = tx.send(SearchEvent::Log(format!(
         "抽象ラベル={} / 彩色候補={} / 4個消しモード={} / 計測={}",
         info.labels.iter().collect::<String>(),
         colorings.len(),
@@ -57,14 +65,13 @@ pub fn run_search(
     {
         let bmi2 = std::is_x86_feature_detected!("bmi2");
         let popcnt = std::is_x86_feature_detected!("popcnt");
-        let _ = tx.send(Message::Log(format!(
+        let _ = tx.send(SearchEvent::Log(format!(
             "CPU features: bmi2={} / popcnt={}",
             bmi2, popcnt
         )));
     }
 
-    type Meta = (HashMap<char, u8>, [ColGen; W], [u8; W], Vec<usize>);
-    let mut metas: Vec<Meta> = Vec::new();
+    let mut metas: Vec<ColoringMeta> = Vec::new();
     let mut total = BigUint::zero();
     for assign in &colorings {
         let mut map = HashMap::<char, u8>::new();
@@ -72,7 +79,7 @@ pub fn run_search(
             map.insert(lab, assign[i]);
         }
         let templ = apply_coloring_to_template(&base_board, &map);
-        let mut cols: [Vec<crate::model::TCell>; W] = array_init(|_| Vec::with_capacity(H));
+        let mut cols: [Vec<crate::domain::board::TCell>; W] = array_init(|_| Vec::with_capacity(H));
         for x in 0..W {
             for y in 0..H {
                 cols[x].push(templ[y * W + x]);
@@ -97,171 +104,53 @@ pub fn run_search(
             let mut order: Vec<usize> = (0..W).collect();
             order.sort_by(|&a, &b| counts[a].cmp(&counts[b]));
             let gens: [ColGen; W] = array_init(|x| build_colgen(&cols[x], &counts[x]));
-            metas.push((map, gens, max_fill_arr, order));
+            metas.push(ColoringMeta {
+                label_to_color: map,
+                generators: gens,
+                max_fill: max_fill_arr,
+                column_order: order,
+            });
         }
     }
-    let _ = tx.send(Message::Log(format!(
+    let _ = tx.send(SearchEvent::Log(format!(
         "厳密な総組合せ（列制約適用）: {}",
         total
     )));
 
-    // writer
-    let (wtx, wrx) = unbounded::<Vec<String>>();
-    let tx_for_writer = tx.clone();
-    let writer_handle = {
-        let outfile = outfile.clone();
-        thread::spawn(move || -> Result<()> {
-            let mut io_time = Duration::ZERO;
-            let file = File::create(&outfile)
-                .with_context(|| format!("出力を作成できません: {}", outfile.display()))?;
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-            while let Ok(batch) = wrx.recv() {
-                let t0 = Instant::now();
-                for line in batch {
-                    writer.write_all(line.as_bytes())?;
-                    writer.write_all(b"\n")?;
-                }
-                io_time += t0.elapsed();
-            }
-            writer.flush()?;
-            if io_time != Duration::ZERO {
-                let mut td = TimeDelta::default();
-                td.io_write_total = io_time;
-                let _ = tx_for_writer.send(Message::TimeDelta(td));
-            }
-            Ok(())
-        })
-    };
+    // ライタースレッドを起動
+    let (wtx, writer_handle) = spawn_writer_thread(outfile.clone(), tx.clone());
 
-    // 集約 Progress
-    let (stx, srx) = unbounded::<StatDelta>();
-    let t0 = Instant::now();
-    let tx_progress = tx.clone();
-    let total_clone = total.clone();
-    let abort_for_agg = abort.clone();
+    // 共有データ構造を初期化
     let global_output_once: Arc<DU64Set> =
         Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
     let global_memo: Arc<DU64Map<bool>> =
         Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
 
-    let global_memo_for_agg = global_memo.clone();
-    let lru_limit_for_agg = lru_limit;
-    let agg_handle = thread::spawn(move || {
-        let mut nodes: u64 = 0;
-        let mut outputs: u64 = 0;
-        let mut done = BigUint::zero();
-        let mut pruned: u64 = 0;
-        let mut lhit: u64 = 0;
-        let mut ghit: u64 = 0;
-        let mut mmiss: u64 = 0;
-        let mut last_send = Instant::now();
+    // 集約スレッドを起動
+    let (stx, agg_handle) = spawn_aggregator_thread(
+        total.clone(),
+        lru_limit,
+        stop_progress_plateau,
+        tx.clone(),
+        abort.clone(),
+        global_memo.clone(),
+    );
 
-        let mut last_output: u64 = 0;
-        let mut progress_at_last_output: f64 = 0.0;
-        let plateau: f64 = stop_progress_plateau as f64;
-
-        loop {
-            match srx.recv_timeout(Duration::from_millis(500)) {
-                Ok(d) => {
-                    nodes += d.nodes;
-                    outputs += d.outputs;
-                    if d.leaves > 0 {
-                        done += BigUint::from(d.leaves);
-                    }
-                    pruned += d.pruned;
-                    lhit += d.lhit;
-                    ghit += d.ghit;
-                    mmiss += d.mmiss;
-
-                    if outputs > last_output {
-                        last_output = outputs;
-                        if let (Some(td), Some(tt)) = (done.to_f64(), total_clone.to_f64()) {
-                            if tt > 0.0 {
-                                progress_at_last_output = (td / tt).clamp(0.0, 1.0);
-                            }
-                        }
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    let dt = t0.elapsed().as_secs_f64();
-                    let rate = if dt > 0.0 { nodes as f64 / dt } else { 0.0 };
-                    let memo_len = global_memo_for_agg.len();
-                    let st = Stats {
-                        searching: false,
-                        unique: outputs,
-                        output: outputs,
-                        nodes,
-                        pruned,
-                        memo_hit_local: lhit,
-                        memo_hit_global: ghit,
-                        memo_miss: mmiss,
-                        total: total_clone.clone(),
-                        done: done.clone(),
-                        rate,
-                        memo_len,
-                        lru_limit: lru_limit_for_agg,
-                        profile: ProfileTotals::default(),
-                    };
-                    let _ = tx_progress.send(Message::Finished(st));
-                    break;
-                }
-            }
-
-            if plateau > 0.0 {
-                if let (Some(td), Some(tt)) = (done.to_f64(), total_clone.to_f64()) {
-                    if tt > 0.0 {
-                        let p = (td / tt).clamp(0.0, 1.0);
-                        if p - progress_at_last_output >= plateau {
-                            let msg = format!(
-                                "早期終了: 進捗が {:.1}% 進む間に新規出力がありませんでした（しきい値 {:.1}%）",
-                                (p - progress_at_last_output) * 100.0,
-                                plateau * 100.0
-                            );
-                            let _ = tx_progress.send(Message::Log(msg));
-                            abort_for_agg.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-
-            if last_send.elapsed() >= Duration::from_millis(500) {
-                let dt = t0.elapsed().as_secs_f64();
-                let rate = if dt > 0.0 { nodes as f64 / dt } else { 0.0 };
-                let memo_len = global_memo_for_agg.len();
-                let st = Stats {
-                    searching: true,
-                    unique: outputs,
-                    output: outputs,
-                    nodes,
-                    pruned,
-                    memo_hit_local: lhit,
-                    memo_hit_global: ghit,
-                    memo_miss: mmiss,
-                    total: total_clone.clone(),
-                    done: done.clone(),
-                    rate,
-                    memo_len,
-                    lru_limit: lru_limit_for_agg,
-                    profile: ProfileTotals::default(),
-                };
-                let _ = tx_progress.send(Message::Progress(st));
-                last_send = Instant::now();
-            }
-        }
-    });
+    let t0 = Instant::now();
+    let num_threads = rayon::current_num_threads().max(1);
+    let lru_per_thread = lru_limit / num_threads;
 
     // 並列探索
     metas.par_iter().enumerate().try_for_each(
-        |(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
+        |(i, meta)| -> Result<()> {
             if abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
             let preview_ok = i == 0;
-            let first_x = order[0];
+            let first_x = meta.column_order[0];
             let mut first_candidates: Vec<[u16; 4]> = Vec::new();
-            match &gens[first_x] {
+            match &meta.generators[first_x] {
                 ColGen::Pre(v) => first_candidates.extend_from_slice(v),
                 ColGen::Stream(colv) => {
                     stream_column_candidates(colv, |m| first_candidates.push(m));
@@ -270,11 +159,10 @@ pub fn run_search(
 
             let mut remain_suffix: Vec<u16> = vec![0; W + 1];
             for d in (0..W).rev() {
-                remain_suffix[d] = remain_suffix[d + 1] + max_fill[order[d]] as u16;
+                remain_suffix[d] = remain_suffix[d + 1] + meta.max_fill[meta.column_order[d]] as u16;
             }
 
-            let threads = rayon::current_num_threads().max(1);
-            if first_candidates.len() >= threads {
+            if first_candidates.len() >= num_threads {
                 first_candidates
                     .par_iter()
                     .try_for_each(|masks| -> Result<()> {
@@ -285,8 +173,7 @@ pub fn run_search(
                         for c in 0..4 {
                             cols0[c][first_x] = masks[c];
                         }
-                        let mut memo =
-                            ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                        let mut memo = ApproxLru::new(lru_per_thread);
                         let mut local_output_once: U64Set = U64Set::default();
                         let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -304,15 +191,15 @@ pub fn run_search(
                         let _ = dfs_combine_parallel(
                             1,
                             &mut cols0,
-                            gens,
-                            order,
+                            &meta.generators,
+                            &meta.column_order,
                             threshold,
                             exact_four_only,
                             &mut memo,
                             &mut local_output_once,
                             &global_output_once,
                             &global_memo,
-                            map_label_to_color,
+                            &meta.label_to_color,
                             &mut batch,
                             &wtx,
                             &stx,
@@ -357,14 +244,14 @@ pub fn run_search(
                             });
                         }
                         if profile_enabled && time_delta_has_any(&time_batch) {
-                            let _ = tx.send(Message::TimeDelta(time_batch));
+                            let _ = tx.send(SearchEvent::ProfileDelta(time_batch));
                         }
                         Ok(())
                     })?;
             } else {
-                let second_x = order[1];
+                let second_x = meta.column_order[1];
                 let mut second_candidates: Vec<[u16; 4]> = Vec::new();
-                match &gens[second_x] {
+                match &meta.generators[second_x] {
                     ColGen::Pre(v) => second_candidates.extend_from_slice(v),
                     ColGen::Stream(colv) => {
                         stream_column_candidates(colv, |m| second_candidates.push(m));
@@ -387,8 +274,7 @@ pub fn run_search(
                                 cols0[c][first_x] = masks[c];
                                 cols0[c][second_x] = m2[c];
                             }
-                            let mut memo =
-                                ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                            let mut memo = ApproxLru::new(lru_per_thread);
                             let mut local_output_once: U64Set = U64Set::default();
                             let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -408,15 +294,15 @@ pub fn run_search(
                             let _ = dfs_combine_parallel(
                                 2,
                                 &mut cols0,
-                                gens,
-                                order,
+                                &meta.generators,
+                                &meta.column_order,
                                 threshold,
                                 exact_four_only,
                                 &mut memo,
                                 &mut local_output_once,
                                 &global_output_once,
                                 &global_memo,
-                                map_label_to_color,
+                                &meta.label_to_color,
                                 &mut batch,
                                 &wtx,
                                 &stx,
@@ -461,7 +347,7 @@ pub fn run_search(
                                 });
                             }
                             if profile_enabled && time_delta_has_any(&time_batch) {
-                                let _ = tx.send(Message::TimeDelta(time_batch));
+                                let _ = tx.send(SearchEvent::ProfileDelta(time_batch));
                             }
                         }
                         Ok(())

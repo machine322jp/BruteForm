@@ -1,9 +1,68 @@
 // UI描画用のヘルパー関数
 
 use crate::constants::{H, W};
-use crate::model::cell_style;
+use crate::domain::board::Cell;
 use crate::profiling::{fmt_dur_ms, ProfileTotals};
 use egui::{Color32, RichText, Vec2};
+
+/// セルのスタイル情報を取得（表示テキスト、塗りつぶし色、ストローク）
+pub fn cell_style(c: Cell) -> (String, Color32, egui::Stroke) {
+    match c {
+        Cell::Blank => (
+            "・".to_string(),
+            Color32::WHITE,
+            egui::Stroke::new(1.0, Color32::LIGHT_GRAY),
+        ),
+        Cell::Any => (
+            "N".to_string(),
+            Color32::from_rgb(254, 243, 199),
+            egui::Stroke::new(1.0, Color32::from_rgb(245, 158, 11)),
+        ),
+        Cell::Any4 => (
+            "X".to_string(),
+            Color32::from_rgb(220, 252, 231),
+            egui::Stroke::new(1.0, Color32::from_rgb(22, 163, 74)),
+        ),
+        Cell::Abs(i) => {
+            let ch = (b'A' + i) as char;
+            (
+                ch.to_string(),
+                Color32::from_rgb(238, 242, 255),
+                egui::Stroke::new(1.0, Color32::from_rgb(99, 102, 241)),
+            )
+        }
+        Cell::Fixed(i) => {
+            // 0:R, 1:G, 2:B, 3:Y（表示は R/G/B/Y）
+            match i {
+                0 => (
+                    "R".to_string(),
+                    Color32::from_rgb(254, 226, 226),
+                    egui::Stroke::new(1.0, Color32::from_rgb(239, 68, 68)),
+                ),
+                1 => (
+                    "G".to_string(),
+                    Color32::from_rgb(220, 252, 231),
+                    egui::Stroke::new(1.0, Color32::from_rgb(34, 197, 94)),
+                ),
+                2 => (
+                    "B".to_string(),
+                    Color32::from_rgb(219, 234, 254),
+                    egui::Stroke::new(1.0, Color32::from_rgb(59, 130, 246)),
+                ),
+                3 => (
+                    "Y".to_string(),
+                    Color32::from_rgb(254, 249, 195),
+                    egui::Stroke::new(1.0, Color32::from_rgb(234, 179, 8)),
+                ),
+                _ => (
+                    "?".to_string(),
+                    Color32::LIGHT_GRAY,
+                    egui::Stroke::new(1.0, Color32::DARK_GRAY),
+                ),
+            }
+        }
+    }
+}
 
 /// カラーパレット（4色のぷよ）
 pub const COLOR_PALETTE: [Color32; 4] = [
@@ -17,8 +76,8 @@ pub const COLOR_PALETTE: [Color32; 4] = [
 pub fn draw_pair_preview(ui: &mut egui::Ui, pair: (u8, u8)) {
     let sz = Vec2::new(18.0, 18.0);
     ui.vertical(|ui| {
-        let (txt1, fill1, stroke1) = cell_style(crate::model::Cell::Fixed(pair.1));
-        let (txt0, fill0, stroke0) = cell_style(crate::model::Cell::Fixed(pair.0));
+        let (txt1, fill1, stroke1) = cell_style(Cell::Fixed(pair.1));
+        let (txt0, fill0, stroke0) = cell_style(Cell::Fixed(pair.0));
         let top = egui::Button::new(RichText::new(txt1).size(11.0))
             .min_size(sz)
             .fill(fill1)
@@ -122,4 +181,57 @@ pub fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
                 ui.end_row();
             }
         });
+}
+
+/// 日本語フォントのインストール（Windows用）
+pub fn install_japanese_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+
+    let mut fonts = FontDefinitions::default();
+
+    // Windows フォント候補
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let fontdir = std::path::Path::new(&windir).join("Fonts");
+    let candidates = [
+        "meiryo.ttc",
+        "meiryob.ttc",
+        "YuGothR.ttc",
+        "YuGothM.ttc",
+        "YuGothB.ttc",
+        "YuGothUI.ttc",
+        "YuGothU.ttc",
+        "msgothic.ttc",
+        "msmincho.ttc",
+    ];
+
+    let mut loaded = false;
+    for name in candidates.iter() {
+        let path = fontdir.join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            let key = format!("jp-{}", name.to_lowercase());
+            fonts
+                .font_data
+                .insert(key.clone(), FontData::from_owned(bytes));
+            fonts
+                .families
+                .get_mut(&FontFamily::Proportional)
+                .unwrap()
+                .insert(0, key.clone());
+            fonts
+                .families
+                .get_mut(&FontFamily::Monospace)
+                .unwrap()
+                .insert(0, key.clone());
+            loaded = true;
+            break;
+        }
+    }
+
+    if loaded {
+        ctx.set_fonts(fonts);
+    } else {
+        eprintln!(
+            "日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。"
+        );
+    }
 }

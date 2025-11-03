@@ -1,7 +1,7 @@
 // 総当たり探索ロジック
 
 use crate::app::board_evaluation::BoardEvaluator;
-use crate::chain::{apply_gravity, board_to_cols, Board, CellData, Detector, IterId};
+use crate::domain::chain_legacy::{apply_gravity, board_to_cols, Board, CellData, Detector, IterId};
 use crate::constants::{H, W};
 use crate::vlog;
 use rayon::prelude::*;

@@ -1,17 +1,17 @@
 // DFS探索ロジック
 
-use crate::app::{Message, StatDelta};
+use crate::application::bruteforce::event::{SearchEvent, StatDelta};
 use crate::constants::{DU64Map, DU64Set, U64Set, H, W};
 use crate::prof;
 use crate::profiling::{time_delta_has_any, TimeDelta};
-use crate::search::board::{any_color_has_four, assign_col_unrolled, clear_col_unrolled};
-use crate::search::coloring::{stream_column_candidates, stream_column_candidates_timed, ColGen};
-use crate::search::hash::{
+use crate::domain::board::bitboard::{any_color_has_four, assign_col_unrolled, clear_col_unrolled};
+use crate::domain::constraints::coloring::{stream_column_candidates, stream_column_candidates_timed, ColGen};
+use crate::domain::board::hash::{
     canonical_hash64_fast, encode_canonical_string, fnv1a32, make_json_line_str,
     serialize_board_from_cols,
 };
-use crate::search::lru::ApproxLru;
-use crate::search::pruning::reaches_t_from_pre_single_e1;
+use crate::infrastructure::cache::lru::ApproxLru;
+use crate::application::bruteforce::search::pruning::reaches_t_from_pre_single_e1;
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::{
@@ -46,7 +46,7 @@ pub fn dfs_combine_parallel(
     ghit_batch: &mut u64,
     mmiss_batch: &mut u64,
     preview_ok: bool,
-    preview_tx: &Sender<Message>,
+    preview_tx: &Sender<SearchEvent>,
     last_preview: &mut Instant,
     _lru_limit: usize,
     t0: Instant,
@@ -123,7 +123,7 @@ pub fn dfs_combine_parallel(
                 if profile_enabled && time_delta_has_any(time_batch) {
                     let td = time_batch.clone();
                     *time_batch = TimeDelta::default();
-                    let _ = preview_tx.send(Message::TimeDelta(td));
+                    let _ = preview_tx.send(SearchEvent::ProfileDelta(td));
                 }
             }
             return Ok(());
@@ -152,7 +152,7 @@ pub fn dfs_combine_parallel(
                 local_output_once.insert(key64);
 
                 if preview_ok && last_preview.elapsed() >= Duration::from_millis(3000) {
-                    let _ = preview_tx.send(Message::Preview(pre));
+                    let _ = preview_tx.send(SearchEvent::Preview(pre));
                     *last_preview = Instant::now();
                 }
 
@@ -212,7 +212,7 @@ pub fn dfs_combine_parallel(
             if profile_enabled && time_delta_has_any(time_batch) {
                 let td = time_batch.clone();
                 *time_batch = TimeDelta::default();
-                let _ = preview_tx.send(Message::TimeDelta(td));
+                let _ = preview_tx.send(SearchEvent::ProfileDelta(td));
             }
         }
         return Ok(());
@@ -258,7 +258,7 @@ pub fn dfs_combine_parallel(
             if profile_enabled && time_delta_has_any(time_batch) {
                 let td = time_batch.clone();
                 *time_batch = TimeDelta::default();
-                let _ = preview_tx.send(Message::TimeDelta(td));
+                let _ = preview_tx.send(SearchEvent::ProfileDelta(td));
             }
         }
         return Ok(());

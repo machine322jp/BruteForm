@@ -2,10 +2,13 @@
 
 use super::chain_play::ChainPlay;
 use super::{Message, Stats};
+use crate::application::bruteforce::SearchHandle;
 use crate::constants::W;
-use crate::model::Cell;
+use crate::domain::board::Cell;
 use crossbeam_channel::Receiver;
-use std::sync::{atomic::AtomicBool, Arc};
+
+/// ログの最大保持行数
+const MAX_LOG_LINES: usize = 500;
 
 /// 画面モード
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,7 +28,6 @@ pub struct App {
     pub exact_four_only: bool,
     pub profile_enabled: bool,
     pub running: bool,
-    pub abort_flag: Arc<AtomicBool>,
     pub rx: Option<Receiver<Message>>,
     pub stats: Stats,
     pub preview: Option<[[u16; W]; 4]>,
@@ -33,6 +35,8 @@ pub struct App {
     pub mode: Mode,
     pub cp: ChainPlay,
     pub verbose_logging: bool,
+    // 検索ハンドル
+    pub search_handle: Option<SearchHandle>,
 }
 
 impl Default for App {
@@ -53,7 +57,6 @@ impl Default for App {
             exact_four_only: false,
             profile_enabled: false,
             running: false,
-            abort_flag: Arc::new(AtomicBool::new(false)),
             rx: None,
             stats: Stats::default(),
             preview: None,
@@ -61,6 +64,7 @@ impl Default for App {
             mode: Mode::BruteForce,
             cp: ChainPlay::default(),
             verbose_logging: false, // デフォルトでログ出力オフ
+            search_handle: None,
         }
     }
 }
@@ -68,8 +72,8 @@ impl Default for App {
 impl App {
     pub fn push_log(&mut self, s: String) {
         self.log_lines.push(s);
-        if self.log_lines.len() > 500 {
-            let cut = self.log_lines.len() - 500;
+        if self.log_lines.len() > MAX_LOG_LINES {
+            let cut = self.log_lines.len() - MAX_LOG_LINES;
             self.log_lines.drain(0..cut);
         }
     }

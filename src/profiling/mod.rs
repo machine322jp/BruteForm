@@ -4,7 +4,7 @@ use crate::constants::W;
 use std::time::Duration;
 
 /// DFS 深さごとの処理時間
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct DfsDepthTimes {
     pub gen_candidates: Duration,
     pub assign_cols: Duration,
@@ -18,7 +18,7 @@ pub struct DfsDepthTimes {
 }
 
 /// DFS 深さごとのカウンタ
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct DfsDepthCounts {
     pub nodes: u64,
     pub cand_generated: u64,
@@ -40,7 +40,7 @@ pub struct ProfileTotals {
 }
 
 /// 時間増分メッセージ用
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct TimeDelta {
     pub dfs_times: [DfsDepthTimes; W + 1],
     pub dfs_counts: [DfsDepthCounts; W + 1],

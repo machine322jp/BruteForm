@@ -48,7 +48,7 @@ pub struct ChainPlay {
     pub beam_width: usize,
     pub max_depth: usize,
     // 連鎖検出結果
-    pub target_chain_info: Option<Vec<crate::chain::ChainStep>>,
+    pub target_chain_info: Option<Vec<crate::domain::chain_legacy::detector::ChainStep>>,
     // 周囲9マスのキャッシュ（1連鎖目と最終連鎖用）
     pub around_cells_cache: Option<(
         std::collections::HashSet<(usize, usize)>,

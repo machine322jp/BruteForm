@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::grid::{board_to_cols, find_bottom_empty, in_range, Board, CellData};
 use crate::constants::{H, W};
-use crate::search::hash::canonical_hash64_fast;
+use crate::domain::board::hash::canonical_hash64_fast;
 use crate::vlog;
 
 const LOG_GEN_VERBOSE: bool = true;

@@ -80,6 +80,20 @@ impl Board {
         board
     }
 
+    /// スライスから構築（6×14 = 84セルが必要）
+    pub fn try_from_slice(cells: &[Cell]) -> Result<Self> {
+        if cells.len() != W * H {
+            return Err(anyhow!("セル数が不正: 期待{}、実際{}", W * H, cells.len()));
+        }
+        
+        let mut board = Self::new();
+        for (i, &cell) in cells.iter().enumerate() {
+            board.cells[i] = cell;
+        }
+        
+        Ok(board)
+    }
+
     /// 文字列表現から構築
     pub fn from_string(s: &str) -> Result<Self> {
         let mut board = Self::new();

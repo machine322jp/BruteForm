@@ -2,7 +2,7 @@
 
 use crate::app::chain_play::{AnimPhase, AnimState, ChainPlay};
 use crate::constants::W;
-use crate::search::board::{
+use crate::domain::board::bitboard::{
     apply_clear_no_fall, apply_given_clear_and_fall, compute_erase_mask_cols,
 };
 

@@ -7,8 +7,8 @@ use super::grid::{
     in_range, remove_groups, Board, CellData, IterId,
 };
 use crate::constants::{H, W};
-use crate::search::board::pack_cols;
-use crate::search::hash::canonical_hash64_fast;
+use crate::domain::board::bitboard::pack_cols;
+use crate::domain::board::hash::canonical_hash64_fast;
 use crate::vlog;
 
 const LOG_DET_VERBOSE: bool = false;

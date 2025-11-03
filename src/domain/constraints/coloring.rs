@@ -1,7 +1,7 @@
 // 彩色と列生成ロジック
 
 use crate::constants::{H, W};
-use crate::model::TCell;
+use crate::domain::board::TCell;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use std::collections::HashMap;

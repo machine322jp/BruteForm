@@ -1,7 +1,7 @@
 // ハッシュとシリアライズ関数
 
 use crate::constants::{BOARD_MASK, H, MASK14, W};
-use crate::search::board::BB;
+use crate::domain::board::bitboard::BB;
 use std::collections::HashMap;
 
 /// LUT風：色マッピングの更新

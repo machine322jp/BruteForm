@@ -1,9 +1,9 @@
-// 監面定数とユーティリティ型定義
+// 盤面定数とユーティリティ型定義
 
 pub use dashmap::{DashMap, DashSet};
 use nohash_hasher::BuildNoHashHasher;
 
-/// ====== 監面定数 ======
+/// ====== 盤面定数 ======
 pub const W: usize = 6;
 pub const H: usize = 14;
 pub const MASK14: u16 = (1u16 << H) - 1;

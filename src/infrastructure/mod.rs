@@ -2,6 +2,7 @@
 
 pub mod storage;
 pub mod executor;
+pub mod cache;
 
 pub use storage::ResultWriter;
 pub use executor::ParallelExecutor;

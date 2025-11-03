@@ -1,5 +1,5 @@
 use crate::constants::{H, W};
-use crate::search::board::{fall_cols_fast, pack_cols};
+use crate::domain::board::bitboard::{fall_cols_fast, pack_cols};
 
 /// 追加配置の世代(イテレーション)識別子
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

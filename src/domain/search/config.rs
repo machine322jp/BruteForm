@@ -23,11 +23,35 @@ impl ChainCount {
     }
 }
 
-/// キャッシュサイズを表すValue Object（千単位）
+/// キャッシュサイズを表すValue Object
+/// 
+/// 探索中に使用するLRUキャッシュの最大エントリ数を管理します。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CacheSize(usize);
 
 impl CacheSize {
+    /// エントリ数で直接指定（推奨）
+    /// 
+    /// # 例
+    /// ```ignore
+    /// let cache = CacheSize::new(300_000)?; // 30万エントリ
+    /// ```
+    pub fn new(entries: usize) -> Result<Self> {
+        if entries == 0 {
+            return Err(anyhow!("キャッシュサイズは1以上です"));
+        }
+        if entries > 10_000_000 {
+            return Err(anyhow!("キャッシュサイズが大きすぎます: {}", entries));
+        }
+        Ok(Self(entries))
+    }
+
+    /// 千単位で指定（後方互換性のため保持）
+    /// 
+    /// # 例
+    /// ```ignore
+    /// let cache = CacheSize::new_in_thousands(300)?; // 30万エントリ
+    /// ```
     pub fn new_in_thousands(k: u32) -> Result<Self> {
         if k == 0 {
             return Err(anyhow!("キャッシュサイズは1以上"));
@@ -38,8 +62,14 @@ impl CacheSize {
         Ok(Self((k as usize) * 1000))
     }
 
+    /// キャッシュエントリ数を取得
     pub fn get(&self) -> usize {
         self.0
+    }
+
+    /// 千単位で取得（表示用）
+    pub fn as_thousands(&self) -> usize {
+        self.0 / 1000
     }
 }
 
@@ -135,5 +165,22 @@ mod tests {
     fn cache_size_accepts_valid() {
         let cache = CacheSize::new_in_thousands(300).unwrap();
         assert_eq!(cache.get(), 300000);
+    }
+
+    #[test]
+    fn cache_size_new_accepts_direct_entries() {
+        let cache = CacheSize::new(300_000).unwrap();
+        assert_eq!(cache.get(), 300_000);
+        assert_eq!(cache.as_thousands(), 300);
+    }
+
+    #[test]
+    fn cache_size_new_rejects_zero() {
+        assert!(CacheSize::new(0).is_err());
+    }
+
+    #[test]
+    fn cache_size_new_rejects_too_large() {
+        assert!(CacheSize::new(10_000_001).is_err());
     }
 }
